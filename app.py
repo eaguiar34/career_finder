@@ -775,7 +775,7 @@ with col1:
             st.session_state.bulk_urls = urls
             st.session_state.bulk_results = items
             st.success("Bulk results updated.")
-    with col2:
+with col2:
         if st.session_state.bulk_results:
             dfb = pd.DataFrame(st.session_state.bulk_results)
             st.download_button("⬇️ Download CSV", data=dfb.to_csv(index=False).encode("utf-8"), file_name="bulk_careers.csv", mime="text/csv")
