@@ -1,34 +1,18 @@
 """
-Career Fair Companion — Streamlit App (Multi‑Major + Apply + Resume + Themes + Assistant)
-Author: You 😊
-License: MIT
+Career Fair Companion — Streamlit App
+Smart company search • Settings tabs • Bulk company URLs • % match jobs • Resume tailoring • Themes • Assistant
 
-New in this version:
-- Multi‑major support: presets for many majors (Engineering, CS, Data, Business/Finance, Marketing/Comms, Design/UX, Life Sciences, Social Sciences, Accounting, **Nursing, Education, Architecture, Environmental Science**).
-- One‑click "Apply Preset" fills role, interests, and assistant defaults; tools/examples in recruiter questions adapt to the chosen major.
-- AI Assistant + preference‑driven search + opt‑in resume tailoring remain.
-
-Run locally:
-  pip install -r requirements.txt
-  streamlit run app.py
-
-Deploy free on Streamlit Community Cloud:
-  Push to GitHub and deploy. Secrets supported: openai_api_key, openai_model, openai_base_url.
+Drop this file at repo root as app.py. Requires requirements.txt from the canvas.
 """
-
 from __future__ import annotations
-import re
-import os
-import io
-import json
-import difflib
+import os, io, re, json, difflib
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
-# --- Optional libs ---
+# ---------- Optional libs ----------
 try:
     from duckduckgo_search import DDGS
 except Exception:
@@ -46,7 +30,7 @@ try:
 except Exception:
     segno = None
 try:
-    from openai import OpenAI  # official or compatible via base_url
+    from openai import OpenAI
 except Exception:
     OpenAI = None
 try:
@@ -57,23 +41,25 @@ try:
     from docx import Document
 except Exception:
     Document = None
-
-from bs4 import BeautifulSoup  # type: ignore
+# BeautifulSoup is optional; degrade gracefully
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:
+    BeautifulSoup = None  # type: ignore
 import requests
 
-# ---------------------------
-# Data Paths
-# ---------------------------
-DATA_DIR = os.path.join("data")
+# ---------- Paths ----------
+DATA_DIR = "data"
 RESUME_DIR = os.path.join(DATA_DIR, "resumes")
+BULK_FILE = os.path.join(DATA_DIR, "companies.txt")  # optional seed file with URLs
 os.makedirs(RESUME_DIR, exist_ok=True)
 INDEX_CSV = os.path.join(RESUME_DIR, "index.csv")
 
-# ---------------------------
-# Themes
-# ---------------------------
-DEFAULT_PRIMARY = "#6C63FF"   # pop purple
-DEFAULT_ACCENT  = "#00D4FF"   # neon cyan
+# ---------- Theme values ----------
+DEFAULT_PRIMARY = "#7C3AED"  # violet-600
+DEFAULT_ACCENT  = "#22D3EE"  # cyan-400
+DEFAULT_BG = "#0B1020"      # deep navy for hero
+DEFAULT_CARD_BG = "#0f172a" # slate-900
 
 SCHOOL_THEMES = {
     "Cal State LA": {"primary": "#000000", "accent": "#FFC72C"},
@@ -83,156 +69,70 @@ SCHOOL_THEMES = {
     "MIT":          {"primary": "#A31F34", "accent": "#8A8B8C"},
 }
 
-# ---------------------------
-# Multi‑Major Presets
-# ---------------------------
-MAJOR_PRESETS: Dict[str, Dict[str, Any]] = {
-    "(Custom)": {
-        "role": "Intern",
-        "interests": ["projects", "research", "leadership"],
-        "tasks": "",
-        "skills": "",
-        "tools": ["Excel", "Python"],
-    },
-    "Civil Engineering": {
-        "role": "Civil Engineering Intern",
-        "interests": ["transportation", "water", "sustainability", "Python"],
-        "tasks": "transportation design, hydrology/hydraulics, site visits, CAD/BIM",
-        "skills": "Civil 3D, AutoCAD, HEC-RAS, BIM, GIS",
-        "tools": ["Civil 3D", "AutoCAD", "HEC-RAS", "MicroStation", "BIM", "GIS"],
-    },
-    "Mechanical Engineering": {
-        "role": "Mechanical Engineering Intern",
-        "interests": ["product design", "FEA", "manufacturing", "MATLAB"],
-        "tasks": "CAD modeling, prototyping, testing, DFM/DFA",
-        "skills": "SolidWorks, CATIA, ANSYS, MATLAB",
-        "tools": ["SolidWorks", "CATIA", "ANSYS", "MATLAB", "Onshape"],
-    },
-    "Electrical/Computer Engineering": {
-        "role": "Electrical Engineering Intern",
-        "interests": ["embedded", "pcb", "firmware", "power"],
-        "tasks": "PCB design, firmware, lab testing",
-        "skills": "Altium, SPICE, Verilog, Python",
-        "tools": ["Altium", "KiCad", "SPICE", "Verilog", "MATLAB"],
-    },
-    "Computer Science / Software": {
-        "role": "Software Engineer Intern",
-        "interests": ["backend", "web", "AI", "data"],
-        "tasks": "APIs, web apps, data pipelines",
-        "skills": "Python, JavaScript, React, Node, SQL",
-        "tools": ["Python", "JS/TS", "React", "Node", "SQL"],
-    },
-    "Data / Analytics": {
-        "role": "Data Analyst Intern",
-        "interests": ["analytics", "dashboards", "A/B testing", "SQL"],
-        "tasks": "dashboards, ETL, experimentation",
-        "skills": "SQL, Python, Tableau, Power BI",
-        "tools": ["SQL", "Python", "Tableau", "Power BI", "R"],
-    },
-    "Business / Finance": {
-        "role": "Finance Intern",
-        "interests": ["FP&A", "valuation", "modeling", "PowerPoint"],
-        "tasks": "financial modeling, reporting, variance analysis",
-        "skills": "Excel, PowerPoint, Bloomberg",
-        "tools": ["Excel", "PowerPoint", "Bloomberg", "SAP"],
-    },
-    "Marketing / Communications": {
-        "role": "Marketing Intern",
-        "interests": ["content", "SEO", "social", "analytics"],
-        "tasks": "campaigns, content, SEO/SEM, analytics",
-        "skills": "GA, SEO tools, CMS",
-        "tools": ["Google Analytics", "Search Console", "Hootsuite", "HubSpot", "Canva"],
-    },
-    "Design / UX": {
-        "role": "UX Designer Intern",
-        "interests": ["user research", "prototyping", "accessibility"],
-        "tasks": "wireframes, prototypes, usability studies",
-        "skills": "Figma, Adobe XD, Sketch",
-        "tools": ["Figma", "Sketch", "Adobe XD", "Miro"],
-    },
-    "Biology / Life Sciences": {
-        "role": "Research Assistant",
-        "interests": ["wet lab", "PCR", "cell culture", "data analysis"],
-        "tasks": "experiments, protocols, data",
-        "skills": "R, Python, Prism",
-        "tools": ["Pipettes", "PCR", "Flow cytometry", "R", "Python"],
-    },
-    "Psychology / Social Science": {
-        "role": "Research Assistant",
-        "interests": ["experiment design", "stats", "survey"],
-        "tasks": "study design, data collection, analysis",
-        "skills": "R, SPSS, Qualtrics",
-        "tools": ["Qualtrics", "SPSS", "R", "Excel"],
-    },
-    "Accounting": {
-        "role": "Accounting Intern",
-        "interests": ["audit", "tax", "GAAP"],
-        "tasks": "bookkeeping, audit/tax support",
-        "skills": "Excel, QuickBooks",
-        "tools": ["Excel", "QuickBooks", "SAP"],
-    },
-    # === Newly added majors ===
-    "Nursing": {
-        "role": "Student Nurse / Nursing Intern",
-        "interests": ["clinical", "patient care", "med-surg", "ICU", "EMR"],
-        "tasks": "vitals, charting, patient education, care coordination",
-        "skills": "BLS, EMR/EHR, phlebotomy, infection control",
-        "tools": ["Epic", "Cerner", "MEDITECH", "Vitals monitors"],
-    },
-    "Education": {
-        "role": "Teaching Assistant / Education Intern",
-        "interests": ["curriculum", "lesson planning", "edtech", "assessment"],
-        "tasks": "lesson prep, grading, classroom management, small‑group instruction",
-        "skills": "Google Classroom, Canvas, formative assessment, IEP basics",
-        "tools": ["Google Classroom", "Canvas", "Kahoot!", "Nearpod", "Zoom"],
-    },
-    "Architecture": {
-        "role": "Architecture Intern",
-        "interests": ["concept design", "BIM", "sustainable design", "3D modeling"],
-        "tasks": "drafting, redlines, 3D modeling, rendering, documentation",
-        "skills": "Revit, AutoCAD, Rhino, SketchUp, Adobe Suite",
-        "tools": ["Revit", "AutoCAD", "Rhino", "SketchUp", "Enscape"],
-    },
-    "Environmental Science": {
-        "role": "Environmental Science Intern",
-        "interests": ["field sampling", "GIS", "EHS", "air/water", "sustainability"],
-        "tasks": "sampling, data analysis, QA/QC, report writing",
-        "skills": "ArcGIS/QGIS, R, Excel, HAZWOPER awareness",
-        "tools": ["ArcGIS", "QGIS", "R", "Excel", "Handheld meters"],
-    },
+# Prefer the corporate entity when names are ambiguous
+COMPANY_FIXUPS = {
+    "jacobs": "Jacobs Solutions",
+    "jacobs engineering": "Jacobs Solutions",
+    "aecom": "AECOM",
+    "meta": "Meta Platforms",
+    "google": "Google",
+    "microsoft": "Microsoft",
 }
 
-# ---------------------------
-# Page & Base Styles
-# ---------------------------
-st.set_page_config(
-    page_title="Career Fair Companion",
-    page_icon="🎓",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+def canonical_company(name: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+    return COMPANY_FIXUPS.get(key, name)
+
+# ---------- Majors (same as prior, abbreviated here for brevity) ----------
+MAJOR_PRESETS: Dict[str, Dict[str, Any]] = {
+    "(Custom)": {"role": "Intern","interests": ["projects","research","leadership"],"tasks": "","skills": "","tools": ["Excel","Python"]},
+    "Civil Engineering": {"role": "Civil Engineering Intern","interests": ["transportation","water","sustainability","Python"],"tasks": "transportation design, hydrology/hydraulics, site visits, CAD/BIM","skills": "Civil 3D, AutoCAD, HEC-RAS, BIM, GIS","tools": ["Civil 3D","AutoCAD","HEC-RAS","MicroStation","BIM","GIS"]},
+    "Mechanical Engineering": {"role": "Mechanical Engineering Intern","interests": ["product design","FEA","manufacturing","MATLAB"],"tasks": "CAD modeling, prototyping, testing, DFM/DFA","skills": "SolidWorks, CATIA, ANSYS, MATLAB","tools": ["SolidWorks","CATIA","ANSYS","MATLAB","Onshape"]},
+    "Electrical/Computer Engineering": {"role": "Electrical Engineering Intern","interests": ["embedded","pcb","firmware","power"],"tasks": "PCB design, firmware, lab testing","skills": "Altium, SPICE, Verilog, Python","tools": ["Altium","KiCad","SPICE","Verilog","MATLAB"]},
+    "Computer Science / Software": {"role": "Software Engineer Intern","interests": ["backend","web","AI","data"],"tasks": "APIs, web apps, data pipelines","skills": "Python, JavaScript, React, Node, SQL","tools": ["Python","JS/TS","React","Node","SQL"]},
+    "Data / Analytics": {"role": "Data Analyst Intern","interests": ["analytics","dashboards","A/B testing","SQL"],"tasks": "dashboards, ETL, experimentation","skills": "SQL, Python, Tableau, Power BI","tools": ["SQL","Python","Tableau","Power BI","R"]},
+    "Business / Finance": {"role": "Finance Intern","interests": ["FP&A","valuation","modeling","PowerPoint"],"tasks": "financial modeling, reporting, variance analysis","skills": "Excel, PowerPoint, Bloomberg","tools": ["Excel","PowerPoint","Bloomberg","SAP"]},
+    "Marketing / Communications": {"role": "Marketing Intern","interests": ["content","SEO","social","analytics"],"tasks": "campaigns, content, SEO/SEM, analytics","skills": "GA, SEO tools, CMS","tools": ["Google Analytics","Search Console","Hootsuite","HubSpot","Canva"]},
+    "Design / UX": {"role": "UX Designer Intern","interests": ["user research","prototyping","accessibility"],"tasks": "wireframes, prototypes, usability studies","skills": "Figma, Adobe XD, Sketch","tools": ["Figma","Sketch","Adobe XD","Miro"]},
+    "Biology / Life Sciences": {"role": "Research Assistant","interests": ["wet lab","PCR","cell culture","data analysis"],"tasks": "experiments, protocols, data","skills": "R, Python, Prism","tools": ["Pipettes","PCR","Flow cytometry","R","Python"]},
+    "Psychology / Social Science": {"role": "Research Assistant","interests": ["experiment design","stats","survey"],"tasks": "study design, data collection, analysis","skills": "R, SPSS, Qualtrics","tools": ["Qualtrics","SPSS","R","Excel"]},
+    "Accounting": {"role": "Accounting Intern","interests": ["audit","tax","GAAP"],"tasks": "bookkeeping, audit/tax support","skills": "Excel, QuickBooks","tools": ["Excel","QuickBooks","SAP"]},
+    # Extras
+    "Nursing": {"role": "Student Nurse / Nursing Intern","interests": ["clinical","patient care","med-surg","ICU","EMR"],"tasks": "vitals, charting, patient education, care coordination","skills": "BLS, EMR/EHR, phlebotomy, infection control","tools": ["Epic","Cerner","MEDITECH","Vitals monitors"]},
+    "Education": {"role": "Teaching Assistant / Education Intern","interests": ["curriculum","lesson planning","edtech","assessment"],"tasks": "lesson prep, grading, classroom management, small‑group instruction","skills": "Google Classroom, Canvas, formative assessment, IEP basics","tools": ["Google Classroom","Canvas","Kahoot!","Nearpod","Zoom"]},
+    "Architecture": {"role": "Architecture Intern","interests": ["concept design","BIM","sustainable design","3D modeling"],"tasks": "drafting, redlines, 3D modeling, rendering, documentation","skills": "Revit, AutoCAD, Rhino, SketchUp, Adobe Suite","tools": ["Revit","AutoCAD","Rhino","SketchUp","Enscape"]},
+    "Environmental Science": {"role": "Environmental Science Intern","interests": ["field sampling","GIS","EHS","air/water","sustainability"],"tasks": "sampling, data analysis, QA/QC, report writing","skills": "ArcGIS/QGIS, R, Excel, HAZWOPER awareness","tools": ["ArcGIS","QGIS","R","Excel","Handheld meters"]},
+}
+
+# ---------- Page ----------
+st.set_page_config(page_title="Career Fair Companion", page_icon="🎓", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown(
     f"""
     <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+      html, body, [class*="css"] {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }}
+      .hero {{
+        background: radial-gradient(1200px 400px at 20% -10%, {DEFAULT_ACCENT}33, transparent),
+                    radial-gradient(800px 300px at 80% -20%, {DEFAULT_PRIMARY}33, transparent);
+        padding: 1.0rem 1.25rem; border-radius: 18px; border: 1px solid #1f2937; 
+      }}
       .app-title {{
         background: linear-gradient(90deg, {DEFAULT_PRIMARY}, {DEFAULT_ACCENT});
         -webkit-background-clip: text; background-clip: text; color: transparent;
-        font-weight: 800; letter-spacing: -0.5px;
+        font-weight: 800; letter-spacing: -0.4px;
       }}
-      .card {{
-        border-radius: 16px; padding: 1rem 1.25rem; border: 1px solid #e5e7eb; background: white; box-shadow: 0 1px 2px rgba(0,0,0,0.03);
-      }}
+      .card {{ border-radius: 16px; padding: 1rem 1.25rem; border: 1px solid #1f2937; background: {DEFAULT_CARD_BG}; box-shadow: 0 8px 24px rgba(0,0,0,0.25); }}
+      .muted {{ color: #94a3b8; }} .small {{ font-size: 0.9rem; }}
+      .match-pill {{ padding: 2px 8px; border-radius: 999px; background: #0ea5e933; border:1px solid #22d3ee; font-weight:600; }}
+      .pill {{ display:inline-block; padding:4px 10px; border-radius:999px; background:#111827; border:1px solid #374151; margin-right:8px; }}
       .btn-primary button {{ background: {DEFAULT_PRIMARY} !important; border-color: {DEFAULT_PRIMARY} !important; }}
-      .btn-accent button {{ background: {DEFAULT_ACCENT} !important; border-color: {DEFAULT_ACCENT} !important; color: black !important; }}
-      .muted {{ color: #94a3b8; }}
-      .small {{ font-size: 0.85rem; }}
-      .match-pill {{ padding: 2px 8px; border-radius: 999px; background: #ecfeff; border:1px solid #a5f3fc; font-weight:600; }}
-      .pref-pill {{ padding: 2px 8px; border-radius: 999px; background: #f0fdf4; border:1px solid #bbf7d0; font-weight:500; margin-right:6px; }}
+      .btn-accent button {{ background: {DEFAULT_ACCENT} !important; border-color: {DEFAULT_ACCENT} !important; color: #0b1020 !important; }}
     </style>
     """,
     unsafe_allow_html=True,
 )
+
 
 def apply_theme(primary: str, accent: str):
     st.markdown(
@@ -243,16 +143,14 @@ def apply_theme(primary: str, accent: str):
             -webkit-background-clip: text; background-clip: text; color: transparent;
           }}
           .btn-primary button {{ background: {primary} !important; border-color: {primary} !important; }}
-          .btn-accent button {{ background: {accent} !important; border-color: {accent} !important; color: black !important; }}
-          .match-pill {{ background: {accent}20; border-color: {accent}; }}
+          .btn-accent button {{ background: {accent} !important; border-color: {accent} !important; color: #0b1020 !important; }}
+          .match-pill {{ background: {accent}22; border-color: {accent}; }}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-# ---------------------------
-# AI Client
-# ---------------------------
+# ---------- AI helpers ----------
 
 def get_ai_client() -> Optional["OpenAI"]:
     if OpenAI is None:
@@ -268,9 +166,7 @@ def get_ai_client() -> Optional["OpenAI"]:
     except Exception:
         return None
 
-# ---------------------------
-# Search + Parsing Helpers
-# ---------------------------
+# ---------- Search helpers ----------
 
 def ddg_search(query: str, max_results: int = 10, timelimit: Optional[str] = None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -297,57 +193,24 @@ def wiki_summary(company: str) -> Optional[str]:
         return None
     try:
         wikipedia.set_lang("en")
-        page_title = wikipedia.search(company, results=1)
+        query = canonical_company(company)
+        # Bias toward corporate entities
+        candidates = [f"{query} (company)", f"{query} (corporation)", query]
+        page_title = None
+        for q in candidates:
+            res = wikipedia.search(q, results=1)
+            if res:
+                page_title = res[0]
+                break
         if not page_title:
             return None
-        page = wikipedia.page(page_title[0])
+        page = wikipedia.page(page_title, auto_suggest=False)
+        # avoid biblical/person pages by simple heuristic
+        if any(w in page.title.lower() for w in ["(patriarch)", "given name", "biblical"]):
+            return None
         return clean_snippet(page.summary, 600)
     except Exception:
         return None
-
-
-def extract_keywords(text: str, top_k: int = 12) -> List[str]:
-    text = re.sub(r"\s+", " ", text)
-    if yake is not None:
-        try:
-            kw = yake.KeywordExtractor(lan="en", n=1, top=top_k)
-            candidates = [k for k, _ in kw.extract_keywords(text)]
-            seen = set(); uniq = []
-            for c in candidates:
-                c = c.lower()
-                if c not in seen and c.isalpha():
-                    seen.add(c); uniq.append(c)
-            return uniq[:top_k]
-        except Exception:
-            pass
-    words = re.findall(r"[A-Za-z][A-Za-z\-\+\.]{1,}", text.lower())
-    stop = set("""
-        a an and are as at be by for from has have in is it its of on or that the to with your you we they this
-        our their will can us if not but than then over under more less most least etc job role position company
-    """.split())
-    freq: Dict[str, int] = {}
-    for w in words:
-        if len(w) <= 2 or w in stop:
-            continue
-        freq[w] = freq.get(w, 0) + 1
-    ranked = sorted(freq.items(), key=lambda x: x[1], reverse=True)
-    return [w for w, _ in ranked[:top_k]]
-
-
-def categorize_domain(url: str) -> str:
-    try:
-        host = re.sub(r"^https?://", "", url).split("/")[0]
-    except Exception:
-        return "Other"
-    if any(k in host for k in ["lever.co", "greenhouse.io", "myworkdayjobs.com", "smartrecruiters.com", "icims.com"]):
-        return "ATS"
-    if any(k in host for k in ["indeed.com", "linkedin.com/jobs", "glassdoor.com/job"]):
-        return "Job Board"
-    if any(k in host for k in ["newsroom", "press", "media", "blog."]):
-        return "Press/Blog"
-    if "linkedin.com/in" in host:
-        return "LinkedIn"
-    return "Other"
 
 
 def fetch_text(url: str, limit: int = 6000) -> str:
@@ -356,23 +219,37 @@ def fetch_text(url: str, limit: int = 6000) -> str:
         r = requests.get(url, headers=headers, timeout=8)
         if r.status_code != 200:
             return ""
-        soup = BeautifulSoup(r.text, "html.parser")
-        txt = soup.get_text(" ", strip=True)
+        html = r.text
+        if BeautifulSoup is not None:
+            soup = BeautifulSoup(html, "html.parser")
+            txt = soup.get_text(" ", strip=True)
+        else:
+            txt = re.sub(r"<[^>]+>", " ", html)
+            txt = re.sub(r"\s+", " ", txt).strip()
         return clean_snippet(txt, length=limit)
     except Exception:
         return ""
 
-# ---------------------------
-# Projects / Jobs (company‑centric)
-# ---------------------------
+
+def find_official_site(company: str) -> Optional[str]:
+    for r in ddg_search(f"{company} official site", max_results=4, timelimit="y"):
+        url = r.get("href") or ""
+        if not url:
+            continue
+        host = re.sub(r"^https?://", "", url).split("/")[0]
+        if not any(s in host for s in ["wikipedia.org", "linkedin.com", "twitter.com"]):
+            return url
+    return None
+
 
 def recent_projects(company: str, max_results: int = 12) -> List[Dict[str, Any]]:
+    brand = canonical_company(company)
     queries = [
-        f"{company} recent projects",
-        f"{company} case study",
-        f"{company} wins contract",
-        f"{company} announces project",
-        f"{company} press release project",
+        f"{brand} recent projects",
+        f"{brand} case study",
+        f"{brand} contract award",
+        f"{brand} announces project",
+        f"{brand} press release project",
     ]
     rows: List[Dict[str, Any]] = []
     for q in queries:
@@ -386,14 +263,29 @@ def recent_projects(company: str, max_results: int = 12) -> List[Dict[str, Any]]
     return uniq[:max_results]
 
 
+def categorize_domain(url: str) -> str:
+    try:
+        host = re.sub(r"^https?://", "", url).split("/")[0]
+    except Exception:
+        return "Other"
+    if any(k in host for k in ["lever.co", "greenhouse.io", "myworkdayjobs.com", "smartrecruiters.com", "icims.com"]):
+        return "ATS"
+    if any(k in host for k in ["indeed.com", "linkedin.com/jobs", "glassdoor.com/job"]):
+        return "Job Board"
+    if any(k in host for k in ["newsroom", "press", "media", "blog."]):
+        return "Press/Blog"
+    return "Other"
+
+
 def job_search(company: str, role: str = "", location: str = "", max_results: int = 18) -> List[Dict[str, Any]]:
+    brand = canonical_company(company)
     base = [
-        f"site:lever.co {company} {role}",
-        f"site:greenhouse.io {company} {role}",
-        f"site:myworkdayjobs.com {company} {role}",
-        f"site:smartrecruiters.com {company} {role}",
-        f"site:icims.com {company} {role}",
-        f"{company} careers {role}",
+        f"site:lever.co {brand} {role}",
+        f"site:greenhouse.io {brand} {role}",
+        f"site:myworkdayjobs.com {brand} {role}",
+        f"site:smartrecruiters.com {brand} {role}",
+        f"site:icims.com {brand} {role}",
+        f"{brand} careers {role}",
     ]
     if location:
         base = [q + f" {location}" for q in base]
@@ -408,9 +300,7 @@ def job_search(company: str, role: str = "", location: str = "", max_results: in
         seen.add(u); uniq.append(row)
     return uniq[:max_results]
 
-# ---------------------------
-# Preference‑driven search (cross‑company)
-# ---------------------------
+# ---- Preference search ----
 
 def prefs_to_queries(p: Dict[str, Any]) -> List[str]:
     role = p.get("role","")
@@ -419,10 +309,7 @@ def prefs_to_queries(p: Dict[str, Any]) -> List[str]:
     location = p.get("location","")
     companies = [c for c in (p.get("companies") or []) if c]
     base_terms = f"{role} {skills} {tasks}".strip()
-    seeds = [
-        "site:lever.co", "site:greenhouse.io", "site:myworkdayjobs.com", "site:smartrecruiters.com", "site:icims.com",
-        "careers",
-    ]
+    seeds = ["site:lever.co","site:greenhouse.io","site:myworkdayjobs.com","site:smartrecruiters.com","site:icims.com","careers"]
     queries = []
     if companies:
         for c in companies:
@@ -466,245 +353,172 @@ def score_job_vs_prefs(job: Dict[str, Any], prefs: Dict[str, Any]) -> Tuple[int,
     task_hits = hit_count(task_kw)
     skill_hits = hit_count(skill_kw)
 
-    if role_ratio > 0.4:
-        details.append(f"role match ~{int(role_ratio*100)}%")
-    if task_hits:
-        details.append(f"{task_hits} task keyword(s)")
-    if skill_hits:
-        details.append(f"{skill_hits} skill keyword(s)")
+    if role_ratio > 0.4: details.append(f"role match ~{int(role_ratio*100)}%")
+    if task_hits: details.append(f"{task_hits} task keyword(s)")
+    if skill_hits: details.append(f"{skill_hits} skill keyword(s)")
     loc_hit = bool(loc and loc in text)
-    if loc_hit:
-        details.append("location match")
+    if loc_hit: details.append("location match")
     if remote:
         r_hit = ("remote" in text) or ("hybrid" in text and remote == "hybrid")
-        if r_hit:
-            details.append("remote/hybrid match")
+        if r_hit: details.append("remote/hybrid match")
     pay_info = parse_pay(text)
     pay_ok = False
     if pay_info and (pay_min or pay_max):
         lo, hi, unit = pay_info
-        if unit.startswith("hour"):
-            lo, hi = lo*2080, hi*2080
+        if unit.startswith("hour"): lo, hi = lo*2080, hi*2080
         low_ok = (pay_min is None) or (hi >= pay_min)
         hi_ok = (pay_max is None) or (lo <= pay_max)
         pay_ok = low_ok and hi_ok
-        if pay_ok:
-            details.append("pay within range")
+        if pay_ok: details.append("pay within range")
 
     score = (
-        35 * role_ratio +
-        20 * (task_hits > 0) +
-        20 * (skill_hits > 0) +
-        10 * (1 if loc_hit else 0) +
-        5  * (1 if pay_ok else 0) +
-        10 * (1 if job.get("source") == "ATS" else 0)
+        35 * role_ratio + 20 * (task_hits > 0) + 20 * (skill_hits > 0) + 10 * (1 if loc_hit else 0) + 5 * (1 if pay_ok else 0) + 10 * (1 if job.get("source") == "ATS" else 0)
     )
     score = max(0, min(100, int(round(score))))
-    if not details:
-        details.append("basic text match")
+    if not details: details.append("basic text match")
     return score, details
 
-# ---------------------------
-# % Match scoring for jobs (company view)
-# ---------------------------
+# Simpler company view score
 
 def _norm_tokens(s: str) -> List[str]:
-    s = s.lower()
-    s = re.sub(r"[^a-z0-9\+\-\s]", " ", s)
+    s = s.lower(); s = re.sub(r"[^a-z0-9\+\-\s]", " ", s)
     return [t for t in s.split() if len(t) > 2]
 
-
 def score_job(job: Dict[str, Any], role: str, interests: List[str], location: str) -> Tuple[int, str]:
-    title = job.get("title") or ""
-    snip = job.get("snippet") or ""
-    url = job.get("url") or ""
+    title = job.get("title") or ""; snip = job.get("snippet") or ""; url = job.get("url") or ""
     body = snip or fetch_text(url)
-
     role_ratio = difflib.SequenceMatcher(a=role.lower(), b=(title + " " + body).lower()).ratio() if role else 0.0
     body_tokens = set(_norm_tokens(title + " " + body))
     interests_norm = [i.lower().strip() for i in interests if i.strip()]
     overlap = sum(1 for i in interests_norm if any(tok in body_tokens for tok in _norm_tokens(i)))
     interest_ratio = (overlap / max(1, len(interests_norm))) if interests_norm else 0.0
     loc_hit = 1 if (location and location.lower() in (title + " " + body + " " + url).lower()) else 0
-    src = job.get("source", "Other")
-    source_bonus = {"ATS": 1.0, "Job Board": 0.6, "Other": 0.4}.get(src, 0.4)
-
+    src = job.get("source", "Other"); source_bonus = {"ATS": 1.0, "Job Board": 0.6, "Other": 0.4}.get(src, 0.4)
     score = 40 * role_ratio + 40 * interest_ratio + 10 * loc_hit + 10 * source_bonus
     score = max(0, min(100, int(round(score))))
-
     reason = f"role~{int(role_ratio*100)}%, interests {overlap}/{len(interests_norm) or 1}, location {'✓' if loc_hit else '—'}, source {src}"
     return score, reason
 
-# ---------------------------
-# Questions (LLM or heuristic)
-# ---------------------------
+# ---------- Bulk companies (URLs) ----------
 
-def smart_questions(company: str, role: str, interests: List[str], job_desc: Optional[str] = None, tool_examples: Optional[List[str]] = None) -> Dict[str, List[str]]:
-    topics = set(i.strip() for i in interests if i.strip())
-    if job_desc:
-        topics.update(extract_keywords(job_desc, top_k=8))
-    topics = {t for t in topics if 2 < len(t) < 28 and re.match(r"^[A-Za-z][A-Za-z0-9\-\+\.\s]+$", t)}
-    topic_sample = list(topics)[:6]
-    tt = ", ".join(topic_sample) if topic_sample else "the core skills for this role"
-    tool_text = ", ".join(tool_examples[:6]) if tool_examples else "industry‑standard tools"
-    buckets = {
-        "Role & Impact": [
-            f"How does {role or 'this role'} define success in the first 90 days, and what metrics matter most?",
-            f"What projects are top priority this quarter, and how would someone in {role or 'this role'} contribute?",
-            f"Among {tt}, which skills would help a candidate stand out in interviews?",
-        ],
-        "Team & Mentorship": [
-            "What does onboarding look like, and how soon do interns/new grads ship meaningful work?",
-            "How is feedback delivered on the team — regular 1:1s, reviews, shadowing?",
-            "Could you share an example of a recent cross‑team collaboration that went well, and why?",
-        ],
-        "Projects & Methods": [
-            f"Which tools are standard here (e.g., {tool_text}) and how consistently are they used across projects?",
-            f"Does the team have a preferred approach for scoping projects and managing risk on tight timelines?",
-            f"For a student interested in {tt}, what projects or case studies would you suggest I study?",
-        ],
-        "Culture & Growth": [
-            "How do interns/new grads find mentors and stretch projects? Any formal rotation or training programs?",
-            "How does the company encourage learning (certifications, conference budgets, courses)?",
-            "What traits do you see in people who thrive here in their first year?",
-        ],
-        "Recruiter‑Specific": [
-            f"Based on my interest in {tt}, which teams should I keep an eye on?",
-            f"What are common pitfalls in applications for {role or 'this role'}, and how can I avoid them?",
-            f"If I follow up after the fair, what should I include to make it easiest for you to move me forward?",
-        ],
-    }
-    if company:
-        for k in buckets:
-            buckets[k] = [q.replace("the company", company).replace("this company", company) for q in buckets[k]]
-    return buckets
-
-# ---------------------------
-# AI wrappers
-# ---------------------------
-
-def summarize_ai(client: "OpenAI", text: str, model: Optional[str] = None) -> Optional[str]:
+def extract_domain(url: str) -> str:
     try:
-        mdl = st.secrets.get("openai_model") or os.environ.get("OPENAI_MODEL") or model or "gpt-4o-mini"
-        out = client.chat.completions.create(model=mdl, messages=[
-            {"role": "system", "content": "You write crisp, factual summaries for career prep."},
-            {"role": "user", "content": f"Summarize this in 4-5 sentences for a student:\n\n{text}"},
-        ], temperature=0.4)
-        return out.choices[0].message.content.strip()
+        url = url.strip()
+        if not re.match(r"^https?://", url):
+            url = "https://" + url
+        host = re.sub(r"^https?://", "", url).split("/")[0]
+        return host.lower()
     except Exception:
-        return None
+        return url
 
 
-def tailor_resume_ai(client: "OpenAI", resume_text: str, company: str, role: str, job_text: str) -> Optional[str]:
-    try:
-        mdl = st.secrets.get("openai_model") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
-        system = (
-            "You are an expert resume editor for early‑career candidates. Rewrite the resume to target the company and role. "
-            "Preserve truthful content, quantify impact where possible, add strong verbs, and align with the job description. "
-            "Keep a clean sectioned structure (Summary, Education, Skills, Experience, Projects, Leadership). Output plain text."
-        )
-        user = (
-            f"Company: {company}\nRole: {role}\nJob description/keywords:\n{job_text}\n\nOriginal resume:\n{resume_text}\n\nReturn ONLY the revised resume as plain text."
-        )
-        out = client.chat.completions.create(model=mdl, messages=[{"role":"system","content":system},{"role":"user","content":user}], temperature=0.4)
-        return out.choices[0].message.content.strip()
-    except Exception:
-        return None
+def ddg_find_careers(domain: str) -> List[Dict[str, str]]:
+    queries = [
+        f"site:{domain} careers",
+        f"site:{domain} jobs",
+        f"site:{domain} internships",
+        f"site:{domain} early careers",
+    ]
+    hits = []
+    for q in queries:
+        for r in ddg_search(q, max_results=5, timelimit="y"):
+            hits.append({"title": r.get("title"), "url": r.get("href"), "snippet": clean_snippet(r.get("body"))})
+    seen = set(); uniq = []
+    for h in hits:
+        u = h["url"]
+        if u in seen: continue
+        seen.add(u); uniq.append(h)
+    return uniq
 
-# ---------------------------
-# Sidebar Inputs (now with Major Preset)
-# ---------------------------
+# ---------- UI: Sidebar as tabs ----------
 
-# init state holders for sticky inputs
-if "role_input" not in st.session_state:
-    st.session_state.role_input = MAJOR_PRESETS["Civil Engineering"]["role"]
-if "interests_input" not in st.session_state:
-    st.session_state.interests_input = ", ".join(MAJOR_PRESETS["Civil Engineering"]["interests"])
-if "preset_tools" not in st.session_state:
-    st.session_state.preset_tools = MAJOR_PRESETS["Civil Engineering"]["tools"]
-if "pref_defaults" not in st.session_state:
-    st.session_state.pref_defaults = {
+# sticky state
+for k, v in {
+    "role_input": MAJOR_PRESETS["Civil Engineering"]["role"],
+    "interests_input": ", ".join(MAJOR_PRESETS["Civil Engineering"]["interests"]),
+    "preset_tools": MAJOR_PRESETS["Civil Engineering"]["tools"],
+    "pref_defaults": {
         "role": MAJOR_PRESETS["Civil Engineering"]["role"],
         "tasks": MAJOR_PRESETS["Civil Engineering"]["tasks"],
         "skills": MAJOR_PRESETS["Civil Engineering"]["skills"],
-    }
+    },
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-st.sidebar.header("🎓 Major Preset + Research Inputs")
-major = st.sidebar.selectbox("Major (preset)", options=list(MAJOR_PRESETS.keys()), index=list(MAJOR_PRESETS.keys()).index("Civil Engineering"))
+with st.sidebar:
+    tabs = st.tabs(["Inputs", "Settings"])
 
-if st.sidebar.button("Apply Preset"):
-    p = MAJOR_PRESETS.get(major, MAJOR_PRESETS["(Custom)"])
-    st.session_state.role_input = p.get("role", "Intern")
-    st.session_state.interests_input = ", ".join(p.get("interests", []))
-    st.session_state.preset_tools = p.get("tools", [])
-    st.session_state.pref_defaults = {
-        "role": p.get("role", "Intern"),
-        "tasks": p.get("tasks", ""),
-        "skills": p.get("skills", ""),
-    }
+    with tabs[0]:
+        st.subheader("🎓 Major Preset + Research Inputs")
+        major = st.selectbox("Major (preset)", options=list(MAJOR_PRESETS.keys()), index=list(MAJOR_PRESETS.keys()).index("Civil Engineering"))
+        if st.button("Apply Preset"):
+            p = MAJOR_PRESETS.get(major, MAJOR_PRESETS["(Custom)"])
+            st.session_state.role_input = p.get("role", "Intern")
+            st.session_state.interests_input = ", ".join(p.get("interests", []))
+            st.session_state.preset_tools = p.get("tools", [])
+            st.session_state.pref_defaults = {
+                "role": p.get("role", "Intern"),
+                "tasks": p.get("tasks", ""),
+                "skills": p.get("skills", ""),
+            }
+        company = st.text_input("Company name", placeholder="e.g., Jacobs, AECOM, Google")
+        role = st.text_input("Target role/title", value=st.session_state.role_input, key="role_sidebar")
+        location = st.text_input("Location filter (optional)", placeholder="e.g., Los Angeles, CA")
+        interests_str = st.text_input("Interests / keywords (comma‑separated)", value=st.session_state.interests_input, key="interests_sidebar")
+        interests = [s.strip() for s in interests_str.split(",") if s.strip()]
 
-company = st.sidebar.text_input("Company name", placeholder="e.g., Jacobs, AECOM, Google")
-role = st.sidebar.text_input("Target role/title", value=st.session_state.role_input, key="role_sidebar")
-location = st.sidebar.text_input("Location filter (optional)", placeholder="e.g., Los Angeles, CA")
-interests_str = st.sidebar.text_input("Interests / keywords (comma‑separated)", value=st.session_state.interests_input, key="interests_sidebar")
-interests = [s.strip() for s in interests_str.split(",") if s.strip()]
+        colA, colB = st.columns(2)
+        with colA: go_research = st.button("Research", type="primary")
+        with colB: go_questions = st.button("Make Questions")
+        colC, colD = st.columns(2)
+        with colC: go_jobs = st.button("Find Jobs")
+        with colD: go_export = st.button("Export Sheet")
 
-st.sidebar.subheader("🎨 Theme")
-school = st.sidebar.selectbox("School", options=["(Default)"] + list(SCHOOL_THEMES.keys()), index=0)
-custom_primary = st.sidebar.color_picker("Primary", value=SCHOOL_THEMES.get("Cal State LA", {}).get("primary", DEFAULT_PRIMARY))
-custom_accent  = st.sidebar.color_picker("Accent", value=SCHOOL_THEMES.get("Cal State LA", {}).get("accent", DEFAULT_ACCENT))
+    with tabs[1]:
+        st.subheader("⚙️ Settings")
+        st.caption("Themes + AI in one place")
+        col1, col2 = st.columns(2)
+        with col1:
+            school = st.selectbox("School theme", options=["(Default)"] + list(SCHOOL_THEMES.keys()), index=0)
+        with col2:
+            st.caption("Pick your vibe")
+        if school != "(Default)":
+            t = SCHOOL_THEMES.get(school, {})
+            primary = t.get("primary", DEFAULT_PRIMARY); accent = t.get("accent", DEFAULT_ACCENT)
+        else:
+            primary = DEFAULT_PRIMARY; accent = DEFAULT_ACCENT
+        custom_primary = st.color_picker("Primary", value=primary)
+        custom_accent  = st.color_picker("Accent", value=accent)
+        apply_theme(custom_primary or primary, custom_accent or accent)
 
-# Compute theme
-p = DEFAULT_PRIMARY; a = DEFAULT_ACCENT
-if school != "(Default)":
-    t = SCHOOL_THEMES.get(school, {})
-    p = t.get("primary", p); a = t.get("accent", a)
-# custom overrides
-p = custom_primary or p
-a = custom_accent or a
-apply_theme(p, a)
+        st.markdown("---")
+        st.subheader("🤖 AI Settings")
+        use_ai = st.toggle("Use AI (OpenAI or compatible)", value=False)
+        model_hint = st.text_input("Model (optional)", value=os.environ.get("OPENAI_MODEL", ""))
+        base_url_hint = st.text_input("Base URL (optional)", value=os.environ.get("OPENAI_BASE_URL", ""))
+        if base_url_hint:
+            st.caption(f"Using custom base_url: {base_url_hint}")
+        notes = st.text_area("Personal notes (kept on device)", height=80)
 
-st.sidebar.subheader("🤖 AI Settings")
-use_ai = st.sidebar.toggle("Use AI (OpenAI or compatible)", value=False)
-model_hint = st.sidebar.text_input("Model (optional)", value=os.environ.get("OPENAI_MODEL", ""))
-base_url_hint = st.sidebar.text_input("Base URL (optional)", value=os.environ.get("OPENAI_BASE_URL", ""))
-if base_url_hint:
-    st.caption(f"Using custom base_url: {base_url_hint}")
+# ---------- Header ----------
 
-notes = st.sidebar.text_area("Personal notes (kept on device)", height=100)
-
-# Actions
-colA, colB = st.sidebar.columns(2)
-with colA:
-    go_research = st.button("Research", type="primary")
-with colB:
-    go_questions = st.button("Make Questions")
-colC, colD = st.sidebar.columns(2)
-with colC:
-    go_jobs = st.button("Find Jobs")
-with colD:
-    go_export = st.button("Export Sheet")
-
-# ---------------------------
-# Header
-# ---------------------------
-
-st.markdown("""
-<div class="card" style="margin-bottom: 0.75rem;">
-  <div style="display:flex; align-items:center; gap:12px;">
-    <div style="font-size:2.3rem;">🎓</div>
-    <div>
-      <div class="app-title" style="font-size:2rem;">Career Fair Companion</div>
-      <div class="muted small">Research companies fast. Ask sharper questions. Find relevant roles (for any major). Tailor resumes. Swap QR cards.</div>
+st.markdown(
+    f"""
+    <div class="hero">
+      <div style="display:flex; align-items:center; gap:12px;">
+        <div style="font-size:2.3rem;">🎓</div>
+        <div>
+          <div class="app-title" style="font-size:2rem;">Career Fair Companion</div>
+          <div class="muted small">Research companies fast. Ask sharper questions. Find relevant roles. Tailor resumes. Swap QR cards.</div>
+        </div>
+      </div>
     </div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
-# ---------------------------
-# Session State
-# ---------------------------
-
+# ---------- Session mem ----------
 for key, default in {
     "projects": [],
     "jobs": [],
@@ -717,22 +531,33 @@ for key, default in {
     "resume_bytes": b"",
     "resume_ext": "",
     "assistant_history": [],
+    "bulk_urls": [],
+    "bulk_results": [],
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ---------------------------
-# Actions logic — company view
-# ---------------------------
+# ---------- Actions ----------
 
 if go_research and company:
     with st.spinner("Researching…"):
-        st.session_state.wiki = wiki_summary(company)
+        cn = canonical_company(company)
+        st.session_state.wiki = wiki_summary(cn)
+        if not st.session_state.wiki:
+            # Fallback to official site meta text
+            site = find_official_site(cn)
+            if site:
+                st.session_state.wiki = fetch_text(site, limit=500)
         if use_ai and (client := get_ai_client()) and st.session_state.wiki:
-            s = summarize_ai(client, st.session_state.wiki, model_hint)
-            if s:
-                st.session_state.wiki = s
-        st.session_state.projects = recent_projects(company)
+            s = (
+                client.chat.completions.create(
+                    model=(st.secrets.get("openai_model") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"),
+                    messages=[{"role":"system","content":"You write crisp, factual company snapshots for students."}, {"role":"user","content":f"Summarize in 4-5 sentences:\n\n{st.session_state.wiki}"}],
+                    temperature=0.4
+                ).choices[0].message.content.strip()
+            )
+            if s: st.session_state.wiki = s
+        st.session_state.projects = recent_projects(cn)
     st.success("Company research updated.")
 
 if go_jobs and company:
@@ -748,19 +573,44 @@ if go_jobs and company:
 
 if go_questions:
     with st.spinner("Generating questions…"):
-        st.session_state.questions = smart_questions(company, role, interests, tool_examples=st.session_state.get("preset_tools", []))
+        # heuristic generator (fast)
+        st.session_state.questions = {
+            "Role & Impact": [
+                f"How does {role or 'this role'} define success in the first 90 days?",
+                "Which projects are top priority this quarter?",
+                "What metrics matter most for early-career hires?",
+            ],
+            "Team & Mentorship": [
+                "What does onboarding look like?",
+                "How often are 1:1s and feedback cycles?",
+                "Any examples of cross-team collaboration for interns/new grads?",
+            ],
+            "Projects & Methods": [
+                "Which tools are standard here?",
+                "How do you scope projects on tight timelines?",
+                f"For someone into {', '.join(interests[:5]) or 'the core skills for this role'}, what would you recommend studying?",
+            ],
+            "Culture & Growth": [
+                "How do interns find mentors and stretch projects?",
+                "Are there rotations or formal training?",
+                "How do you support learning (certs, conferences)?",
+            ],
+            "Recruiter‑Specific": [
+                "Which teams should I watch based on my interests?",
+                "Common pitfalls you see in applications?",
+                "What should I include in a follow‑up email after the fair?",
+            ],
+        }
     st.success("Questions ready.")
 
 if go_export:
     def build_cheatsheet(company: str, role: str, wiki: Optional[str], projects: List[Dict[str, Any]], jobs: List[Dict[str, Any]], questions: Dict[str, List[str]], notes: str = "") -> str:
         now = datetime.now().strftime("%b %d, %Y")
         lines = [f"# {company} — {role} (Career Fair Companion)", f"_Generated {now}_\n"]
-        if wiki:
-            lines += ["## Snapshot", wiki, ""]
+        if wiki: lines += ["## Snapshot", wiki, ""]
         if projects:
             lines.append("## Recent Projects / News")
-            for p in projects[:8]:
-                lines.append(f"- [{p['title']}]({p['url']}) — {p['snippet']}")
+            for p in projects[:8]: lines.append(f"- [{p['title']}]({p['url']}) — {p['snippet']}")
             lines.append("")
         if jobs:
             lines.append("## Job Listings (sorted by match)")
@@ -771,31 +621,17 @@ if go_export:
             lines.append("## Questions for Recruiters")
             for bucket, qs in questions.items():
                 lines.append(f"### {bucket}")
-                for q in qs:
-                    lines.append(f"- {q}")
+                for q in qs: lines.append(f"- {q}")
             lines.append("")
-        if notes:
-            lines += ["## My Notes", notes, ""]
+        if notes: lines += ["## My Notes", notes, ""]
         return "\n".join(lines)
     md = build_cheatsheet(company or "(no company)", role or "(role)", st.session_state.wiki, st.session_state.projects, st.session_state.jobs, st.session_state.questions, notes)
     st.download_button("⬇️ Download Cheat Sheet (Markdown)", data=md.encode("utf-8"), file_name=f"{(company or 'company').lower().replace(' ','_')}_cheatsheet.md", mime="text/markdown")
 
-# ---------------------------
-# Tabs
-# ---------------------------
+# ---------- Main tabs ----------
 
-overview_tab, projects_tab, jobs_tab, apply_tab, assistant_tab, q_tab, prep_tab, contacts_tab, qr_tab, saved_tab, help_tab = st.tabs([
-    "Overview",
-    "Recent Projects",
-    "Jobs",
-    "Apply",
-    "AI Assistant",
-    "Recruiter Questions",
-    "Prep: Understand a Job Posting",
-    "Contacts",
-    "My Card (QR)",
-    "Saved",
-    "Help & Setup",
+overview_tab, projects_tab, jobs_tab, bulk_tab, apply_tab, assistant_tab, q_tab, prep_tab, contacts_tab, qr_tab, saved_tab, help_tab = st.tabs([
+    "Overview","Recent Projects","Jobs","Bulk Companies","Apply","AI Assistant","Recruiter Questions","Prep: Understand a Job Posting","Contacts","My Card (QR)","Saved","Help & Setup",
 ])
 
 with overview_tab:
@@ -843,6 +679,60 @@ with jobs_tab:
     else:
         st.caption("No jobs yet — try Find Jobs in the sidebar.")
 
+with bulk_tab:
+    st.subheader("Bulk Companies — paste multiple career sites")
+    st.caption("Paste or upload multiple company URLs. I’ll try to find careers pages and sample listings.")
+    txt = st.text_area("Paste URLs (one per line)", height=120, placeholder="https://www.jacobs.com\nhttps://www.aecom.com\nhttps://www.wsp.com ...")
+    up = st.file_uploader("Or upload .txt / .csv (column: url or company,url)", type=["txt","csv"])
+    col1, col2 = st.columns(2)
+    urls: List[str] = []
+    if txt.strip():
+        urls += [u.strip() for u in txt.splitlines() if u.strip()]
+    if up is not None:
+        try:
+            if up.name.lower().endswith(".csv"):
+                dfu = pd.read_csv(up)
+                if "url" in dfu.columns:
+                    urls += [str(x) for x in dfu["url"].dropna().tolist()]
+                else:
+                    urls += [str(x) for x in dfu.iloc[:,0].dropna().tolist()]
+            else:
+                raw = up.read().decode("utf-8", errors="ignore")
+                urls += [u.strip() for u in raw.splitlines() if u.strip()]
+        except Exception as e:
+            st.error(f"Could not parse file: {e}")
+    # Optional seed file on disk
+    if not urls and os.path.exists(BULK_FILE):
+        try:
+            with open(BULK_FILE, "r", encoding="utf-8") as f:
+                urls = [l.strip() for l in f if l.strip()]
+            st.info("Loaded companies from data/companies.txt")
+        except Exception:
+            pass
+
+    with col1:
+        if st.button("Scan for Careers", type="primary"):
+            items = []
+            for u in urls[:80]:
+                dom = extract_domain(u)
+                hits = ddg_find_careers(dom)
+                if not hits:
+                    items.append({"domain": dom, "careers_url": "(none)", "title": "", "snippet": ""})
+                else:
+                    for h in hits[:3]:
+                        items.append({"domain": dom, "careers_url": h["url"], "title": h["title"], "snippet": h["snippet"]})
+            st.session_state.bulk_urls = urls
+            st.session_state.bulk_results = items
+            st.success("Bulk results updated.")
+    with col2:
+        if st.session_state.bulk_results:
+            dfb = pd.DataFrame(st.session_state.bulk_results)
+            st.download_button("⬇️ Download CSV", data=dfb.to_csv(index=False).encode("utf-8"), file_name="bulk_careers.csv", mime="text/csv")
+
+    if st.session_state.bulk_results:
+        dfb = pd.DataFrame(st.session_state.bulk_results)
+        st.dataframe(dfb, use_container_width=True, hide_index=True)
+
 with apply_tab:
     st.subheader("Apply — Tailor Resume & Open Application")
     if not st.session_state.jobs:
@@ -882,23 +772,28 @@ with apply_tab:
                 if not st.session_state.resume_text.strip():
                     st.warning("Upload a resume first.")
                 else:
-                    if use_ai_tailor and use_ai and (client := get_ai_client()):
-                        out = tailor_resume_ai(client, st.session_state.resume_text, company or "(Company)", role or "(Role)", job_text)
-                        if out:
-                            st.session_state.tailored = out
+                    if use_ai_tailor and (client := get_ai_client()):
+                        try:
+                            mdl = st.secrets.get("openai_model") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
+                            system = (
+                                "You are an expert resume editor for early‑career candidates. Rewrite the resume to target the company and role. "
+                                "Preserve truthful content, quantify impact where possible, add strong verbs, and align with the job description. "
+                                "Keep a clean sectioned structure (Summary, Education, Skills, Experience, Projects, Leadership). Output plain text."
+                            )
+                            user = (f"Company: {company}\nRole: {role}\nJob description/keywords:\n{job_text}\n\nOriginal resume:\n{st.session_state.resume_text}\n\nReturn ONLY the revised resume as plain text.")
+                            out = client.chat.completions.create(model=mdl, messages=[{"role":"system","content":system},{"role":"user","content":user}], temperature=0.4)
+                            st.session_state.tailored = out.choices[0].message.content.strip()
                             st.success("Tailored resume ready (AI).")
-                        else:
-                            st.error("AI tailoring failed. Falling back to keyword highlighting.")
+                        except Exception:
                             kws = extract_keywords(job_text, top_k=12)
                             base = st.session_state.resume_text
-                            for k in kws:
-                                base = re.sub(fr"\b({re.escape(k)})\b", r"**\1**", base, flags=re.I)
+                            for k in kws: base = re.sub(fr"\b({re.escape(k)})\b", r"**\1**", base, flags=re.I)
                             st.session_state.tailored = base
+                            st.info("AI unavailable — used keyword highlighting.")
                     else:
                         kws = extract_keywords(job_text, top_k=12)
                         base = st.session_state.resume_text
-                        for k in kws:
-                            base = re.sub(fr"\b({re.escape(k)})\b", r"**\1**", base, flags=re.I)
+                        for k in kws: base = re.sub(fr"\b({re.escape(k)})\b", r"**\1**", base, flags=re.I)
                         st.session_state.tailored = base
                         st.info("Tailored (heuristic) using job keywords.")
         with col2:
@@ -913,13 +808,7 @@ with apply_tab:
             fname = f"resume_{(company or 'company').lower().replace(' ','_')}_{ts}.docx"
             full = os.path.join(RESUME_DIR, fname)
             if save_docx_from_text(tail, full):
-                append_resume_index({
-                    "timestamp": ts,
-                    "company": company,
-                    "role": role,
-                    "job_url": job["url"],
-                    "file": fname,
-                })
+                append_resume_index({"timestamp": ts, "company": company, "role": role, "job_url": job["url"], "file": fname})
                 with open(full, "rb") as f:
                     st.download_button("⬇️ Download tailored DOCX", data=f.read(), file_name=fname, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
                 st.success(f"Saved to databank: data/resumes/{fname}")
@@ -928,34 +817,22 @@ with apply_tab:
 
 with assistant_tab:
     st.subheader("AI Assistant — Describe what you want in a job")
-    st.caption("Chat uses OpenAI or any OpenAI‑compatible local server if configured. Otherwise responses will be heuristic.")
-
+    st.caption("Chat uses OpenAI or any OpenAI‑compatible server if configured.")
     left, right = st.columns([2,1])
     with right:
         st.markdown("**Your preferences**")
-        pd = st.session_state.pref_defaults
-        pref_role = st.text_input("Desired role/title", value=pd.get("role","Intern"))
-        pref_tasks = st.text_area("Tasks / responsibilities", value=pd.get("tasks",""))
-        pref_skills = st.text_input("Skills / keywords", value=pd.get("skills",""))
+        pd0 = st.session_state.pref_defaults
+        pref_role = st.text_input("Desired role/title", value=pd0.get("role","Intern"))
+        pref_tasks = st.text_area("Tasks / responsibilities", value=pd0.get("tasks",""))
+        pref_skills = st.text_input("Skills / keywords", value=pd0.get("skills",""))
         pref_location = st.text_input("Preferred location", value="Los Angeles, CA")
         pref_remote = st.selectbox("Work mode", ["any","on-site","hybrid","remote"], index=1)
         colx, coly = st.columns(2)
-        with colx:
-            pref_pay_min = st.number_input("Min pay (annual $)", value=0, step=1000)
-        with coly:
-            pref_pay_max = st.number_input("Max pay (annual $)", value=0, step=1000)
-        pref_companies = st.text_input("Target companies (comma‑separated)", placeholder="optional")
+        with colx: pref_pay_min = st.number_input("Min pay (annual $)", value=0, step=1000)
+        with coly: pref_pay_max = st.number_input("Max pay (annual $)", value=0, step=1000)
+        pref_companies = st.text_input("Target companies (comma‑separated)")
         pref_companies_list = [c.strip() for c in pref_companies.split(",") if c.strip()]
-        prefs = {
-            "role": pref_role,
-            "tasks": pref_tasks,
-            "skills": pref_skills,
-            "location": pref_location,
-            "remote": pref_remote if pref_remote != "any" else "",
-            "pay_min": int(pref_pay_min) if pref_pay_min else None,
-            "pay_max": int(pref_pay_max) if pref_pay_max else None,
-            "companies": pref_companies_list,
-        }
+        prefs = {"role": pref_role,"tasks": pref_tasks,"skills": pref_skills,"location": pref_location,"remote": pref_remote if pref_remote != "any" else "","pay_min": int(pref_pay_min) if pref_pay_min else None,"pay_max": int(pref_pay_max) if pref_pay_max else None,"companies": pref_companies_list}
         if st.button("Find jobs by preferences", type="primary"):
             with st.spinner("Searching across ATS and boards…"):
                 rows: List[Dict[str,Any]] = []
@@ -983,22 +860,16 @@ with assistant_tab:
         if user_msg:
             st.session_state.assistant_history.append({"role":"user","content":user_msg})
             reply = None
-            if use_ai and (client := get_ai_client()):
+            if (client := get_ai_client()):
                 try:
                     mdl = st.secrets.get("openai_model") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
-                    sys = (
-                        "You are a helpful career search copilot. Ask clarifying questions if the request is vague; "
-                        "propose search strategies and concrete keywords for ATS sites; keep answers concise."
-                    )
-                    out = client.chat.completions.create(model=mdl, temperature=0.3, messages=[
-                        {"role":"system","content":sys},
-                        *st.session_state.assistant_history,
-                    ])
+                    sys = "You are a helpful career search copilot. Ask clarifying questions if vague; propose search strategies and concrete keywords for ATS sites; keep answers concise."
+                    out = client.chat.completions.create(model=mdl, temperature=0.3, messages=[{"role":"system","content":sys}, *st.session_state.assistant_history])
                     reply = out.choices[0].message.content
                 except Exception:
-                    reply = "I couldn't reach the AI service. Try entering details in the preference form on the right, then click 'Find jobs by preferences'."
+                    reply = "I couldn't reach the AI service. Fill out the preference form and click 'Find jobs by preferences'."
             else:
-                reply = "Got it — fill out the preferences on the right and hit 'Find jobs by preferences'. You can also add keywords like 'internship', 'junior', or a certification to tighten results."
+                reply = "I’m in non‑AI mode — fill the preferences on the right and hit 'Find jobs by preferences'."
             st.session_state.assistant_history.append({"role":"assistant","content":reply})
             st.rerun()
 
@@ -1012,8 +883,7 @@ with assistant_tab:
                 with left:
                     st.caption(j["source"])  
                     st.write(j["snippet"])  
-                    if j.get("details"):
-                        st.markdown("Matched: " + ", ".join([f"`{d}`" for d in j["details"]]))
+                    if j.get("details"): st.markdown("Matched: " + ", ".join([f"`{d}`" for d in j["details"]]))
                 with right:
                     st.markdown(f"<div class='match-pill'>{j.get('match',0)}% match</div>", unsafe_allow_html=True)
 
@@ -1022,8 +892,7 @@ with q_tab:
     if st.session_state.questions:
         for bucket, qs in st.session_state.questions.items():
             with st.expander(bucket, expanded=True):
-                for q in qs:
-                    st.markdown(f"- {q}")
+                for q in qs: st.markdown(f"- {q}")
     else:
         st.caption("Click Make Questions in the sidebar to generate a tailored list.")
 
@@ -1037,8 +906,13 @@ with prep_tab:
                 kws = extract_keywords(jd, top_k=14)
                 st.markdown("**Key topics / skills detected:**")
                 st.write(", ".join(kws) if kws else "(none)")
-                extra = smart_questions(company, role, kws, job_desc=jd, tool_examples=st.session_state.get("preset_tools", []))
-                st.session_state.questions = extra
+                st.session_state.questions = {
+                    "Role & Impact": ["Which of these skills will I use most in the first 90 days?", "What does success look like for this role?"],
+                    "Team & Mentorship": ["What would my onboarding look like?", "How are interns/new grads mentored?"],
+                    "Projects & Methods": [f"Which tools are standard (e.g., {', '.join(kws[:6])})?", "How are projects scoped and tracked?"],
+                    "Culture & Growth": ["How are feedback and growth supported?", "Any rotations or training programs?"],
+                    "Recruiter‑Specific": ["Which teams align with this posting?", "Any common pitfalls you see for this role?"],
+                }
                 st.success("Updated questions based on the posting.")
             else:
                 st.warning("Please paste a job description first.")
@@ -1047,13 +921,10 @@ with prep_tab:
             st.session_state.saved.append({"type":"notes","data":{"company":company, "role":role, "notes":jd}})
             st.toast("Saved to your list.")
 
-# ---------------------------
-# Contacts finder
-# ---------------------------
+# ---------- Contacts ----------
 
 def find_contacts(company: str, role: str = "") -> List[Dict[str, str]]:
-    if not company:
-        return []
+    if not company: return []
     queries = [
         f'site:linkedin.com/in ("Recruiter" OR "Talent Acquisition" OR "University Recruiter") "{company}"',
         f'site:linkedin.com/company {company} people recruiter',
@@ -1087,10 +958,10 @@ with contacts_tab:
 
     st.divider()
     st.markdown("**Import Contacts (CSV)**")
-    up = st.file_uploader("Upload CSV with columns: name,email,title,company,notes", type=["csv"], key="contacts_csv")
-    if up is not None:
+    upc = st.file_uploader("Upload CSV with columns: name,email,title,company,notes", type=["csv"], key="contacts_csv")
+    if upc is not None:
         try:
-            dfc = pd.read_csv(up)
+            dfc = pd.read_csv(upc)
             st.dataframe(dfc, use_container_width=True, hide_index=True)
             if st.button("Add to Saved Contacts"):
                 for _, r in dfc.iterrows():
@@ -1104,21 +975,10 @@ with contacts_tab:
         st.markdown("**My Contacts**")
         st.dataframe(pd.DataFrame(st.session_state.contacts), use_container_width=True)
 
-# ---------------------------
-# QR Card / vCard
-# ---------------------------
+# ---------- QR ----------
 
 def build_vcard(name: str, title: str, email: str, phone: str, org: str, linkedin: str, website: str) -> str:
-    lines = [
-        "BEGIN:VCARD","VERSION:3.0",f"FN:{name}",
-        f"TITLE:{title}" if title else "",
-        f"ORG:{org}" if org else "",
-        f"EMAIL;TYPE=INTERNET:{email}" if email else "",
-        f"TEL;TYPE=CELL:{phone}" if phone else "",
-        f"URL:{linkedin}" if linkedin else "",
-        f"URL:{website}" if website else "",
-        "END:VCARD",
-    ]
+    lines = ["BEGIN:VCARD","VERSION:3.0",f"FN:{name}", f"TITLE:{title}" if title else "", f"ORG:{org}" if org else "", f"EMAIL;TYPE=INTERNET:{email}" if email else "", f"TEL;TYPE=CELL:{phone}" if phone else "", f"URL:{linkedin}" if linkedin else "", f"URL:{website}" if website else "", "END:VCARD"]
     return "\n".join([l for l in lines if l])
 
 with qr_tab:
@@ -1139,9 +999,7 @@ with qr_tab:
                 for line in vtxt.splitlines():
                     if line.startswith(tag+":"): return line.split(":",1)[1].strip()
                 return ""
-            name = name or pick("FN")
-            title_i = title_i or pick("TITLE")
-            org = org or pick("ORG")
+            name = name or pick("FN"); title_i = title_i or pick("TITLE"); org = org or pick("ORG")
             if not linkedin:
                 for line in vtxt.splitlines():
                     if line.startswith("URL:") and "linkedin" in line.lower():
@@ -1177,69 +1035,7 @@ with qr_tab:
             vcf = build_vcard(name, title_i, email, phone, org, linkedin, website)
             st.download_button("⬇️ Save vCard", data=vcf.encode("utf-8"), file_name="my_contact.vcf", mime="text/vcard")
 
-# ---------------------------
-# Resume helpers
-# ---------------------------
-
-def parse_resume(upload) -> Tuple[str, bytes, str]:
-    raw = upload.read()
-    name = upload.name.lower()
-    ext = ".txt"
-    if name.endswith(".pdf"):
-        ext = ".pdf"
-        if PdfReader is None:
-            return "", raw, ext
-        try:
-            reader = PdfReader(io.BytesIO(raw))
-            pages = [p.extract_text() or "" for p in reader.pages]
-            return "\n".join(pages), raw, ext
-        except Exception:
-            return "", raw, ext
-    if name.endswith(".docx"):
-        ext = ".docx"
-        if Document is None:
-            return "", raw, ext
-        try:
-            doc = Document(io.BytesIO(raw))
-            txt = "\n".join([p.text for p in doc.paragraphs])
-            return txt, raw, ext
-        except Exception:
-            return "", raw, ext
-    try:
-        return raw.decode("utf-8", errors="ignore"), raw, ".txt"
-    except Exception:
-        return "", raw, ".bin"
-
-
-def save_docx_from_text(text: str, path: str):
-    if Document is None:
-        return False
-    try:
-        doc = Document()
-        for line in text.splitlines():
-            if line.strip().startswith("# "):
-                doc.add_heading(line.strip("# ").strip(), level=1)
-            elif line.strip().startswith("## "):
-                doc.add_heading(line.strip("# ").strip(), level=2)
-            else:
-                doc.add_paragraph(line)
-        doc.save(path)
-        return True
-    except Exception:
-        return False
-
-
-def append_resume_index(meta: Dict[str, Any]):
-    cols = ["timestamp","company","role","job_url","file"]
-    row = {k: meta.get(k, "") for k in cols}
-    df = pd.DataFrame([row])
-    if os.path.exists(INDEX_CSV):
-        base = pd.read_csv(INDEX_CSV)
-        base = pd.concat([base, df], ignore_index=True)
-        base.to_csv(INDEX_CSV, index=False)
-    else:
-        df.to_csv(INDEX_CSV, index=False)
-
+# ---------- Saved ----------
 with saved_tab:
     st.subheader("My Saved Items")
     if not st.session_state.saved and not os.path.exists(INDEX_CSV):
@@ -1251,20 +1047,15 @@ with saved_tab:
                 if item["type"] == "project":
                     p = item["data"]
                     with st.container(border=True):
-                        st.markdown(f"**[Project] [{p['title']}]({p['url']})**")
-                        st.caption(p["source"])  
-                        st.write(p["snippet"])  
+                        st.markdown(f"**[Project] [{p['title']}]({p['url']})**"); st.caption(categorize_domain(p["url"])) ; st.write(p["snippet"])
                 elif item["type"] == "job":
                     j = item["data"]
                     with st.container(border=True):
-                        st.markdown(f"**[Job] [{j['title']}]({j['url']})** — {j.get('match',0)}% match")
-                        st.caption(j["source"])  
-                        st.write(j["snippet"])  
+                        st.markdown(f"**[Job] [{j['title']}]({j['url']})** — {j.get('match',0)}% match"); st.caption(j["source"]) ; st.write(j["snippet"])
                 elif item["type"] == "notes":
                     n = item["data"]
                     with st.container(border=True):
-                        st.markdown(f"**[Notes] {n.get('company') or ''} — {n.get('role') or ''}**")
-                        st.write(n.get("notes", ""))
+                        st.markdown(f"**[Notes] {n.get('company') or ''} — {n.get('role') or ''}**"); st.write(n.get("notes", ""))
         if os.path.exists(INDEX_CSV):
             st.markdown("### Tailored Resumes Databank")
             df = pd.read_csv(INDEX_CSV)
@@ -1291,7 +1082,7 @@ with help_tab:
 
         **Databank**: tailored resumes are saved under `data/resumes/` with an `index.csv`. On Streamlit Cloud, storage may be ephemeral; download important files.
 
-        **AI**: works with OpenAI OR any OpenAI‑compatible local server (e.g., Ollama). Set `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `OPENAI_MODEL` env vars.
+        **Bulk companies**: paste URLs, upload CSV/TXT, or place a `data/companies.txt` with one URL per line.
         """
     )
 
@@ -1300,6 +1091,55 @@ st.markdown("""
   Built with ❤️ using Streamlit + DuckDuckGo + Wikipedia + YAKE + Segno. Optional OpenAI/compatible LLM support.
 </div>
 """, unsafe_allow_html=True)
+
+# ---------- Resume helpers ----------
+
+def parse_resume(upload) -> Tuple[str, bytes, str]:
+    raw = upload.read(); name = upload.name.lower(); ext = ".txt"
+    if name.endswith(".pdf"):
+        ext = ".pdf"
+        if PdfReader is None: return "", raw, ext
+        try:
+            reader = PdfReader(io.BytesIO(raw))
+            pages = [p.extract_text() or "" for p in reader.pages]
+            return "\n".join(pages), raw, ext
+        except Exception: return "", raw, ext
+    if name.endswith(".docx"):
+        ext = ".docx"
+        if Document is None: return "", raw, ext
+        try:
+            doc = Document(io.BytesIO(raw))
+            txt = "\n".join([p.text for p in doc.paragraphs])
+            return txt, raw, ext
+        except Exception: return "", raw, ext
+    try:
+        return raw.decode("utf-8", errors="ignore"), raw, ".txt"
+    except Exception:
+        return "", raw, ".bin"
+
+
+def save_docx_from_text(text: str, path: str):
+    if Document is None: return False
+    try:
+        doc = Document()
+        for line in text.splitlines():
+            if line.strip().startswith("# "): doc.add_heading(line.strip("# ").strip(), level=1)
+            elif line.strip().startswith("## "): doc.add_heading(line.strip("# ").strip(), level=2)
+            else: doc.add_paragraph(line)
+        doc.save(path); return True
+    except Exception: return False
+
+
+def append_resume_index(meta: Dict[str, Any]):
+    cols = ["timestamp","company","role","job_url","file"]
+    row = {k: meta.get(k, "") for k in cols}
+    df = pd.DataFrame([row])
+    if os.path.exists(INDEX_CSV):
+        base = pd.read_csv(INDEX_CSV)
+        base = pd.concat([base, df], ignore_index=True)
+        base.to_csv(INDEX_CSV, index=False)
+    else:
+        df.to_csv(INDEX_CSV, index=False)
 
 if __name__ == "__main__":
     pass
