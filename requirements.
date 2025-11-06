@@ -4,8 +4,9 @@ requests>=2.32
 beautifulsoup4>=4.12
 duckduckgo-search>=6.1
 wikipedia>=1.4
-yake @ git+https://github.com/LIAAD/yake#egg=yake # optional; or pin a wheel if available
+yake>=0.4.8
 segno>=1.6
 PyPDF2>=3.0
 python-docx>=1.1
 openai>=1.51
+
