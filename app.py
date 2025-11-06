@@ -54,6 +54,13 @@ RESUME_DIR = os.path.join(DATA_DIR, "resumes")
 BULK_FILE = os.path.join(DATA_DIR, "companies.txt")  # optional seed file with URLs
 os.makedirs(RESUME_DIR, exist_ok=True)
 INDEX_CSV = os.path.join(RESUME_DIR, "index.csv")
+PRESET_TXT_FILES = []
+try:
+    for fn in sorted([f for f in os.listdir(DATA_DIR) if f.endswith(".txt")]):
+        PRESET_TXT_FILES.append(os.path.join(DATA_DIR, fn))
+except Exception:
+    PRESET_TXT_FILES = [BULK_FILE]  # fallback
+
 
 # ---------- Theme values ----------
 DEFAULT_PRIMARY = "#7C3AED"  # violet-600
@@ -684,6 +691,21 @@ with bulk_tab:
     st.caption("Paste or upload multiple company URLs. I’ll try to find careers pages and sample listings.")
     txt = st.text_area("Paste URLs (one per line)", height=120, placeholder="https://www.jacobs.com\nhttps://www.aecom.com\nhttps://www.wsp.com ...")
     up = st.file_uploader("Or upload .txt / .csv (column: url or company,url)", type=["txt","csv"])
+   
+# Preset file picker
+preset_labels = [f"data/{os.path.basename(p)}" for p in PRESET_TXT_FILES]
+preset_choice = st.selectbox("Or load a preset list", preset_labels, index=0)
+if st.button("Load preset"):
+    chosen_fp = PRESET_TXT_FILES[preset_labels.index(preset_choice)]
+    try:
+        with open(chosen_fp, "r", encoding="utf-8") as f:
+            preset_urls = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+        # stash for later so it participates in the scan
+        st.session_state.bulk_urls = preset_urls
+        st.success(f"Loaded {len(preset_urls)} URLs from {os.path.basename(chosen_fp)}")
+    except Exception as e:
+        st.error(f"Could not load preset: {e}")
+
     col1, col2 = st.columns(2)
     urls: List[str] = []
     if txt.strip():
@@ -709,6 +731,40 @@ with bulk_tab:
             st.info("Loaded companies from data/companies.txt")
         except Exception:
             pass
+
+# Collect URLs from all sources (paste, preset, upload, default file)
+urls: List[str] = []
+if txt.strip():
+    urls += [u.strip() for u in txt.splitlines() if u.strip() and not u.strip().startswith("#")]
+
+if st.session_state.get("bulk_urls"):
+    urls += [u for u in st.session_state.bulk_urls if u]
+
+if up is not None:
+    try:
+        if up.name.lower().endswith(".csv"):
+            dfu = pd.read_csv(up)
+            if "url" in dfu.columns:
+                urls += [str(x) for x in dfu["url"].dropna().tolist()]
+            else:
+                urls += [str(x) for x in dfu.iloc[:, 0].dropna().tolist()]
+        else:
+            raw = up.read().decode("utf-8", errors="ignore")
+            urls += [u.strip() for u in raw.splitlines() if u.strip() and not u.strip().startswith("#")]
+    except Exception as e:
+        st.error(f"Could not parse file: {e}")
+
+# Optional default if still empty
+if not urls and os.path.exists(BULK_FILE):
+    with open(BULK_FILE, "r", encoding="utf-8") as f:
+        urls = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+
+# De-dup while keeping order
+urls = list(dict.fromkeys(urls))
+
+    ...
+# De-dup
+urls = list(dict.fromkeys(urls))
 
     with col1:
         if st.button("Scan for Careers", type="primary"):
