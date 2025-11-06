@@ -764,7 +764,7 @@ urls = list(dict.fromkeys(urls))
 with col1:
     if st.button("Scan for Careers", type="primary"):
             items = []
-        for u in urls[:80]:
+            for u in urls[:80]:
                 dom = extract_domain(u)
                 hits = ddg_find_careers(dom)
             if not hits:
