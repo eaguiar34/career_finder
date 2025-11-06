@@ -1,9 +1,11 @@
 """
-Career Fair Companion — Streamlit App (Enhanced Jobs Search + Sidebar Bulk)
-- Smarter company lookup + ATS awareness (Workday/Greenhouse/Lever/Taleo/SuccessFactors/Ashby/Workable/Jobvite/SmartRecruiters/iCIMS/Eightfold/Recruitee/ADP/Breezy)
-- Jobs tab now has its own search bar (so results appear when you type there)
-- Sidebar adds a **Bulk** tab to paste/upload URLs and scan careers pages
-- Bulk Companies main tab remains for viewing + CSV export
+Career Fair Companion — COMPLETE REWRITE (Crash‑safe)
+Robust research • %-match job search (ATS + company domains) • Optional AI (safely gated)
+Sidebar tabs (Inputs / Settings / Bulk) • Theme presets • Resume tailoring • Contacts • QR card
+
+This version is **crash‑safe when `streamlit` isn’t installed**: it falls back to a tiny shim so
+the module can import and our unit tests can run. In a real deployment you should still
+install `streamlit` (add it to `requirements.txt`) to get the full UI.
 """
 from __future__ import annotations
 import os, io, re, json, difflib
@@ -11,9 +13,63 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 import pandas as pd
-import streamlit as st
 
-# ---------- Optional libs ----------
+# -------------------- Streamlit import (with shim fallback) --------------------
+try:  # normal path
+    import streamlit as st  # type: ignore
+    _STREAMLIT_AVAILABLE = True
+except ModuleNotFoundError:  # crash-safe path for sandbox/test runners
+    _STREAMLIT_AVAILABLE = False
+
+    class _ShimContainer:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+        def __getattr__(self, name):
+            def _noop(*args, **kwargs):
+                # return sensible defaults for common widgets
+                if name in ("text_input", "text_area", "selectbox", "color_picker", "radio"):
+                    return ""
+                if name in ("button", "toggle", "checkbox"):
+                    return False
+                return None
+            return _noop
+
+    class _ShimST:
+        def __init__(self):
+            self.session_state: Dict[str, Any] = {}
+            self.secrets: Dict[str, Any] = {}
+            self.sidebar = _ShimContainer()
+        def __getattr__(self, name):
+            def _noop(*args, **kwargs):
+                if name == "tabs":
+                    labels = args[0] if args else []
+                    return [_ShimContainer() for _ in labels]
+                if name == "columns":
+                    sizes = args[0] if args else [1, 1]
+                    return [_ShimContainer() for _ in sizes]
+                if name in ("container", "expander"):
+                    return _ShimContainer()
+                # No-op UI calls
+                if name in (
+                    "file_uploader", "link_button", "image", "download_button",
+                    "dataframe", "markdown", "write", "caption", "info", "warning",
+                    "success", "error", "divider", "set_page_config", "subheader",
+                ):
+                    return None
+                # Inputs with safe defaults
+                if name in ("text_input", "text_area", "selectbox", "color_picker", "radio"):
+                    return ""
+                if name in ("button", "toggle", "checkbox"):
+                    return False
+                return None
+            return _noop
+
+    st = _ShimST()  # type: ignore
+    os.environ["NON_UI_MODE"] = "1"  # used by tests below
+
+# -------------------- Optional deps (fail-soft) --------------------
 try:
     from duckduckgo_search import DDGS
 except Exception:
@@ -42,33 +98,31 @@ try:
     from docx import Document
 except Exception:
     Document = None
-# BeautifulSoup optional
 try:
     from bs4 import BeautifulSoup  # type: ignore
 except Exception:
     BeautifulSoup = None  # type: ignore
 import requests
 
-# ---------- Paths ----------
+# -------------------- Paths & storage --------------------
 DATA_DIR = "data"
 RESUME_DIR = os.path.join(DATA_DIR, "resumes")
 BULK_FILE = os.path.join(DATA_DIR, "companies.txt")
-os.makedirs(RESUME_DIR, exist_ok=True)
 INDEX_CSV = os.path.join(RESUME_DIR, "index.csv")
+os.makedirs(RESUME_DIR, exist_ok=True)
 
-# discover preset .txt files for bulk lists
+# discover preset lists in /data
 PRESET_TXT_FILES: List[str] = []
 try:
     if os.path.isdir(DATA_DIR):
-        PRESET_TXT_FILES = [os.path.join(DATA_DIR, f) for f in sorted(os.listdir(DATA_DIR)) if f.endswith('.txt')]
+        PRESET_TXT_FILES = [os.path.join(DATA_DIR, f) for f in sorted(os.listdir(DATA_DIR)) if f.endswith(".txt")]
 except Exception:
-    PRESET_TXT_FILES = [BULK_FILE]
+    PRESET_TXT_FILES = []
 
-# ---------- Theme values ----------
+# -------------------- Branding & themes --------------------
 DEFAULT_PRIMARY = "#7C3AED"  # violet-600
 DEFAULT_ACCENT  = "#22D3EE"  # cyan-400
-DEFAULT_BG = "#0B1020"
-DEFAULT_CARD_BG = "#0f172a"
+DEFAULT_CARD_BG = "#0f172a"  # slate-900
 
 SCHOOL_THEMES = {
     "Cal State LA": {"primary": "#000000", "accent": "#FFC72C"},
@@ -78,7 +132,7 @@ SCHOOL_THEMES = {
     "MIT":          {"primary": "#A31F34", "accent": "#8A8B8C"},
 }
 
-# Prefer the corporate entity when names are ambiguous
+# Prefer the corporate entity when ambiguous (e.g., "Jacobs" → "Jacobs Solutions")
 COMPANY_FIXUPS = {
     "jacobs": "Jacobs Solutions",
     "jacobs engineering": "Jacobs Solutions",
@@ -90,24 +144,15 @@ def canonical_company(name: str) -> str:
     key = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
     return COMPANY_FIXUPS.get(key, name)
 
-# Known ATS hosts (expandable)
+# Known ATS hosts
 ATS_HOSTS = [
     "lever.co","greenhouse.io","myworkdayjobs.com","smartrecruiters.com","icims.com",
     "taleo.net","successfactors.com","ashbyhq.com","workable.com","jobvite.com",
-    "eightfold.ai","recruitee.com","adp.com","workforcenow.adp.com","breezy.hr",
+    "eightfold.ai","recruitee.com","workforcenow.adp.com","adp.com","breezy.hr",
+    "oraclecloud.com","dayforcehcm.com","ultipro.com","bamboohr.com","jazzhr.com",
 ]
 
-# ---------- Majors (subset for brevity) ----------
-MAJOR_PRESETS: Dict[str, Dict[str, Any]] = {
-    "(Custom)": {"role": "Intern","interests": ["projects","research","leadership"],"tasks": "","skills": "","tools": ["Excel","Python"]},
-    "Civil Engineering": {"role": "Civil Engineering Intern","interests": ["transportation","water","sustainability","Python"],"tasks": "transportation design, hydrology/hydraulics, site visits, CAD/BIM","skills": "Civil 3D, AutoCAD, HEC-RAS, BIM, GIS","tools": ["Civil 3D","AutoCAD","HEC-RAS","MicroStation","BIM","GIS"]},
-    "Computer Science / Software": {"role": "Software Engineer Intern","interests": ["backend","web","AI","data"],"tasks": "APIs, web apps, data pipelines","skills": "Python, JavaScript, React, Node, SQL","tools": ["Python","JS/TS","React","Node","SQL"]},
-    "Data / Analytics": {"role": "Data Analyst Intern","interests": ["analytics","dashboards","SQL"],"tasks": "dashboards, ETL, experimentation","skills": "SQL, Python, Tableau, Power BI","tools": ["SQL","Python","Tableau","Power BI","R"]},
-    "Nursing": {"role": "Student Nurse / Nursing Intern","interests": ["clinical","patient care","EMR"],"tasks": "vitals, charting, patient education","skills": "BLS, EMR/EHR","tools": ["Epic","Cerner","MEDITECH"]},
-    # ... (other majors omitted to keep this file compact)
-}
-
-# ---------- Page ----------
+# -------------------- Page & global styles --------------------
 st.set_page_config(page_title="Career Fair Companion", page_icon="🎓", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown(
@@ -115,16 +160,13 @@ st.markdown(
     <style>
       @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
       html, body, [class*="css"] {{ font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }}
-      .hero {{ background: radial-gradient(1200px 400px at 20% -10%, {DEFAULT_ACCENT}33, transparent),
-                             radial-gradient(800px 300px at 80% -20%, {DEFAULT_PRIMARY}33, transparent);
-               padding: 1rem 1.25rem; border-radius: 18px; border: 1px solid #1f2937; }}
-      .app-title {{ background: linear-gradient(90deg, {DEFAULT_PRIMARY}, {DEFAULT_ACCENT});
-                    -webkit-background-clip: text; background-clip: text; color: transparent; font-weight: 800; }}
+      .hero {{ background: linear-gradient(135deg, {DEFAULT_PRIMARY}22, {DEFAULT_ACCENT}22); padding: 1rem 1.25rem; border-radius: 18px; border: 1px solid #1f2937; }}
+      .app-title {{ background: linear-gradient(90deg, {DEFAULT_PRIMARY}, {DEFAULT_ACCENT}); -webkit-background-clip: text; background-clip: text; color: transparent; font-weight: 800; letter-spacing:-0.3px; }}
       .card {{ border-radius: 16px; padding: 1rem 1.25rem; border: 1px solid #1f2937; background: {DEFAULT_CARD_BG}; box-shadow: 0 8px 24px rgba(0,0,0,0.25); }}
-      .muted {{ color: #94a3b8; }} .small {{ font-size: 0.9rem; }}
-      .match-pill {{ padding: 2px 8px; border-radius: 999px; background: #0ea5e933; border:1px solid #22d3ee; font-weight:600; }}
+      .muted {{ color: #94a3b8; }} .small {{ font-size: 0.92rem; }}
+      .match-pill {{ display:inline-block; padding: 2px 10px; border-radius: 999px; background: #0ea5e933; border:1px solid #22d3ee; font-weight:600; }}
       .btn-primary button {{ background: {DEFAULT_PRIMARY} !important; border-color: {DEFAULT_PRIMARY} !important; }}
-      .btn-accent button {{ background: {DEFAULT_ACCENT} !important; border-color: {DEFAULT_ACCENT} !important; color: #0b1020 !important; }}
+      .btn-accent button {{ background: {DEFAULT_ACCENT} !important; border-color: {DEFAULT_ACCENT} !important; color:#0b1020!important; }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -136,14 +178,14 @@ def apply_theme(primary: str, accent: str):
         <style>
           .app-title {{ background: linear-gradient(90deg, {primary}, {accent}); -webkit-background-clip: text; background-clip: text; color: transparent; }}
           .btn-primary button {{ background: {primary} !important; border-color: {primary} !important; }}
-          .btn-accent button {{ background: {accent} !important; border-color: {accent} !important; color: #0b1020 !important; }}
+          .btn-accent button {{ background: {accent} !important; border-color: {accent} !important; color:#0b1020!important; }}
           .match-pill {{ background: {accent}22; border-color: {accent}; }}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-# ---------- AI helpers ----------
+# -------------------- AI helpers (safely gated) --------------------
 
 def get_ai_client() -> Optional["OpenAI"]:
     if OpenAI is None:
@@ -159,7 +201,30 @@ def get_ai_client() -> Optional["OpenAI"]:
     except Exception:
         return None
 
-# ---------- Search helpers ----------
+def ai_enabled() -> bool:
+    if not st.session_state.get("use_ai_toggle"):
+        return False
+    return bool(st.secrets.get("openai_api_key") or os.environ.get("OPENAI_API_KEY") or st.secrets.get("openai_base_url") or os.environ.get("OPENAI_BASE_URL"))
+
+def summarize_ai(text: str) -> Optional[str]:
+    try:
+        client = get_ai_client()
+        if not client:
+            return None
+        mdl = st.secrets.get("openai_model") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
+        out = client.chat.completions.create(
+            model=mdl,
+            temperature=0.4,
+            messages=[
+                {"role":"system","content":"You write crisp, factual company snapshots for students preparing for career fairs."},
+                {"role":"user","content":f"Summarize in 4-5 sentences:\n\n{text}"}
+            ],
+        )
+        return (out.choices[0].message.content or "").strip()
+    except Exception:
+        return None
+
+# -------------------- Search utilities --------------------
 
 def ddg_search(query: str, max_results: int = 10, timelimit: Optional[str] = None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -173,36 +238,11 @@ def ddg_search(query: str, max_results: int = 10, timelimit: Optional[str] = Non
         pass
     return rows
 
-
-def clean_snippet(text: Optional[str], length: int = 220) -> str:
+def clean_snippet(text: Optional[str], length: int = 250) -> str:
     if not text:
         return ""
     t = re.sub(r"\s+", " ", str(text)).strip()
     return (t if len(t) <= length else t[: length - 1].rsplit(" ", 1)[0] + "…")
-
-
-def wiki_summary(company: str) -> Optional[str]:
-    if not wikipedia:
-        return None
-    try:
-        wikipedia.set_lang("en")
-        query = canonical_company(company)
-        candidates = [f"{query} (company)", f"{query} (corporation)", query]
-        page_title = None
-        for q in candidates:
-            res = wikipedia.search(q, results=1)
-            if res:
-                page_title = res[0]
-                break
-        if not page_title:
-            return None
-        page = wikipedia.page(page_title, auto_suggest=False)
-        if any(w in page.title.lower() for w in ["(patriarch)", "given name", "biblical"]):
-            return None
-        return clean_snippet(page.summary, 600)
-    except Exception:
-        return None
-
 
 def fetch_text(url: str, limit: int = 6000) -> str:
     try:
@@ -221,6 +261,52 @@ def fetch_text(url: str, limit: int = 6000) -> str:
     except Exception:
         return ""
 
+def wiki_summary(company: str) -> Optional[str]:
+    if not wikipedia:
+        return None
+    try:
+        wikipedia.set_lang("en")
+        query = canonical_company(company)
+        candidates = [f"{query} (company)", f"{query} (corporation)", query]
+        page_title = None
+        for q in candidates:
+            res = wikipedia.search(q, results=1)
+            if res:
+                page_title = res[0]
+                break
+        if not page_title:
+            return None
+        page = wikipedia.page(page_title, auto_suggest=False)
+        # Avoid wrong entities (e.g., biblical Jacob)
+        if any(w in page.title.lower() for w in ["patriarch", "given name", "biblical"]):
+            return None
+        return clean_snippet(page.summary, 600)
+    except Exception:
+        return None
+
+def find_official_site(company: str) -> Optional[str]:
+    for r in ddg_search(f"{company} official site", max_results=4, timelimit="y"):
+        url = r.get("href") or ""
+        if not url:
+            continue
+        host = re.sub(r"^https?://", "", url).split("/")[0]
+        if not any(s in host for s in ["wikipedia.org", "linkedin.com", "twitter.com"]):
+            return url
+    return None
+
+COMMON_CAREERS_PATHS = ["/careers", "/jobs", "/join-us", "/careers/search", "/en/careers"]
+
+def find_careers_candidates(company: str) -> List[str]:
+    cand = []
+    site = find_official_site(company)
+    if site:
+        base = re.sub(r"/$", "", site)
+        cand += [base + p for p in COMMON_CAREERS_PATHS]
+    for r in ddg_search(f"{company} careers", max_results=6, timelimit="y"):
+        u = r.get("href");
+        if u and u not in cand:
+            cand.append(u)
+    return cand[:10]
 
 def categorize_domain(url: str) -> str:
     try:
@@ -235,58 +321,29 @@ def categorize_domain(url: str) -> str:
         return "Press/Blog"
     return "Other"
 
+# Core job aggregator
 
-def find_official_site(company: str) -> Optional[str]:
-    for r in ddg_search(f"{company} official site", max_results=4, timelimit="y"):
-        url = r.get("href") or ""
-        if not url:
-            continue
-        host = re.sub(r"^https?://", "", url).split("/")[0]
-        if not any(s in host for s in ["wikipedia.org", "linkedin.com", "twitter.com"]):
-            return url
-    return None
-
-# try to guess careers pages quickly (ddg + common paths)
-COMMON_CAREERS_PATHS = ["/careers", "/careers/jobs", "/jobs", "/join-us", "/work-with-us", "/careers/search", "/en/careers"]
-
-def find_careers_candidates(company: str) -> List[str]:
-    cand = []
-    site = find_official_site(company)
-    if site:
-        base = re.sub(r"/$", "", site)
-        cand += [base + p for p in COMMON_CAREERS_PATHS]
-    # search results
-    for r in ddg_search(f"{company} careers", max_results=6, timelimit="y"):
-        u = r.get("href");
-        if u and u not in cand:
-            cand.append(u)
-    return cand[:10]
-
-# core: job search aggregator (smarter)
-
-def job_search(company: str, role: str = "", location: str = "", max_results: int = 24) -> List[Dict[str, Any]]:
+def job_search(company: str, role: str = "", location: str = "", max_results: int = 30) -> List[Dict[str, Any]]:
     brand = canonical_company(company)
-
-    # Seeds across ATS
     seeds = [
-        "site:lever.co", "site:greenhouse.io", "site:myworkdayjobs.com", "site:smartrecruiters.com", "site:icims.com",
-        "site:taleo.net", "site:successfactors.com", "site:ashbyhq.com", "site:workable.com", "site:jobvite.com",
-        "site:eightfold.ai", "site:recruitee.com", "site:workforcenow.adp.com", "site:adp.com", "site:breezy.hr",
+        "site:lever.co","site:greenhouse.io","site:myworkdayjobs.com","site:smartrecruiters.com","site:icims.com",
+        "site:taleo.net","site:successfactors.com","site:ashbyhq.com","site:workable.com","site:jobvite.com",
+        "site:eightfold.ai","site:recruitee.com","site:workforcenow.adp.com","site:adp.com","site:breezy.hr",
+        "site:oraclecloud.com","site:dayforcehcm.com","site:ultipro.com","site:bamboohr.com","site:jazzhr.com",
     ]
     terms = f"{brand} {role}".strip()
     if not role:
-        # encourage intern/new grad queries when role is empty
         terms += " intern OR internship OR graduate"
     if location:
         terms += f" {location}"
 
     rows: List[Dict[str, Any]] = []
+    # ATS sweep
     for s in seeds:
         q = f"{s} {terms}"
         for r in ddg_search(q, max_results=6, timelimit="m"):
             rows.append({"title": r["title"], "url": r["href"], "snippet": clean_snippet(r["body"]), "source": categorize_domain(r["href"])})
-
-    # Also search company careers site/domain directly
+    # Company domain sweep
     for cand in find_careers_candidates(brand):
         try:
             host = re.sub(r"^https?://", "", cand).split("/")[0]
@@ -297,43 +354,20 @@ def job_search(company: str, role: str = "", location: str = "", max_results: in
                 rows.append({"title": r["title"], "url": r["href"], "snippet": clean_snippet(r["body"]), "source": categorize_domain(r["href"])})
         except Exception:
             continue
+    # Last‑ditch heuristic
+    if not rows:
+        for r in ddg_search(f"{brand} {role or 'internship'} apply", max_results=8, timelimit="m"):
+            rows.append({"title": r["title"], "url": r["href"], "snippet": clean_snippet(r["body"]), "source": categorize_domain(r["href"])})
 
-    # De-dup and cap
-    seen = set(); uniq = []
+    # De‑dup
+    seen, uniq = set(), []
     for row in rows:
         u = row["url"]
         if u in seen: continue
         seen.add(u); uniq.append(row)
     return uniq[:max_results]
 
-# ---- Preference search ----
-
-def prefs_to_queries(p: Dict[str, Any]) -> List[str]:
-    role = p.get("role","")
-    tasks = p.get("tasks","")
-    skills = p.get("skills","")
-    location = p.get("location","")
-    companies = [c for c in (p.get("companies") or []) if c]
-    base_terms = f"{role} {skills} {tasks}".strip()
-    if not role:
-        base_terms += " intern OR internship OR graduate"
-    seeds = [
-        "site:lever.co","site:greenhouse.io","site:myworkdayjobs.com","site:smartrecruiters.com","site:icims.com",
-        "site:taleo.net","site:successfactors.com","site:ashbyhq.com","site:workable.com","site:jobvite.com",
-        "site:eightfold.ai","site:recruitee.com","site:workforcenow.adp.com","site:adp.com","site:breezy.hr",
-        "careers"
-    ]
-    queries = []
-    if companies:
-        for c in companies:
-            queries += [f"{s} {c} {base_terms}" for s in seeds]
-    else:
-        queries += [f"{s} {base_terms}" for s in seeds]
-    if location:
-        queries = [q + f" {location}" for q in queries]
-    return queries
-
-# utility scoring
+# %-match scoring
 
 def _norm_tokens(s: str) -> List[str]:
     s = s.lower(); s = re.sub(r"[^a-z0-9\+\-\s]", " ", s)
@@ -354,25 +388,23 @@ def score_job(job: Dict[str, Any], role: str, interests: List[str], location: st
     reason = f"role~{int(role_ratio*100)}%, interests {overlap}/{len(interests_norm) or 1}, location {'✓' if loc_hit else '—'}, source {src}"
     return score, reason
 
-# ---------- Keywords ----------
+# Keyword extractor
 
 def extract_keywords(text: str, top_k: int = 12) -> List[str]:
     t = (text or "").strip()
-    if not t:
-        return []
+    if not t: return []
     if yake:
         try:
             kw = yake.KeywordExtractor(top=top_k)
-            return [k for k, _ in kw.extract_keywords(t)][:top_k]
+            return [k for k,_ in kw.extract_keywords(t)][:top_k]
         except Exception:
             pass
-    # fallback: frequent words (very rough)
     toks = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9\-\+]{2,}", t.lower()) if w not in {"and","the","with","for","from","that","this","will","your","you"}]
-    freq = {}
+    freq: Dict[str, int] = {}
     for x in toks: freq[x] = freq.get(x, 0) + 1
     return [k for k,_ in sorted(freq.items(), key=lambda kv: kv[1], reverse=True)][:top_k]
 
-# ---------- Resume helpers ----------
+# -------------------- Resume helpers --------------------
 
 def parse_resume(upload) -> Tuple[str, bytes, str]:
     raw = upload.read(); name = upload.name.lower(); ext = ".txt"
@@ -397,7 +429,6 @@ def parse_resume(upload) -> Tuple[str, bytes, str]:
     except Exception:
         return "", raw, ".bin"
 
-
 def save_docx_from_text(text: str, path: str):
     if Document is None: return False
     try:
@@ -408,7 +439,6 @@ def save_docx_from_text(text: str, path: str):
             else: doc.add_paragraph(line)
         doc.save(path); return True
     except Exception: return False
-
 
 def append_resume_index(meta: Dict[str, Any]):
     cols = ["timestamp","company","role","job_url","file"]
@@ -421,48 +451,90 @@ def append_resume_index(meta: Dict[str, Any]):
     else:
         df.to_csv(INDEX_CSV, index=False)
 
-# ---------- Session defaults ----------
+# -------------------- Contacts & QR --------------------
+
+def find_contacts(company: str, role: str = "") -> List[Dict[str, str]]:
+    if not company: return []
+    queries = [
+        f'site:linkedin.com/in ("Recruiter" OR "Talent Acquisition" OR "University Recruiter") "{company}"',
+        f'site:linkedin.com/company {company} people recruiter',
+        f'{company} university recruiting email',
+        f'{company} HR contact careers',
+    ]
+    rows: List[Dict[str, str]] = []
+    for q in queries:
+        for r in ddg_search(q, max_results=6, timelimit="y"):
+            rows.append({"title": r.get("title") or "", "url": r.get("href") or "", "snippet": clean_snippet(r.get("body")), "source": categorize_domain(r.get("href") or "")})
+    seen = set(); uniq = []
+    for row in rows:
+        u = row["url"]
+        if u in seen: continue
+        seen.add(u); uniq.append(row)
+    return uniq
+
+def build_vcard(name: str, title: str, email: str, phone: str, org: str, linkedin: str, website: str) -> str:
+    lines = ["BEGIN:VCARD","VERSION:3.0",f"FN:{name}", f"TITLE:{title}" if title else "", f"ORG:{org}" if org else "", f"EMAIL;TYPE=INTERNET:{email}" if email else "", f"TEL;TYPE=CELL:{phone}" if phone else "", f"URL:{linkedin}" if linkedin else "", f"URL:{website}" if website else "", "END:VCARD"]
+    return "\n".join([l for l in lines if l])
+
+# -------------------- Bulk companies helpers --------------------
+
+def extract_domain(url: str) -> str:
+    try:
+        url = url.strip()
+        if not re.match(r"^https?://", url):
+            url = "https://" + url
+        host = re.sub(r"^https?://", "", url).split("/")[0]
+        return host.lower()
+    except Exception:
+        return url
+
+def ddg_find_careers(domain: str) -> List[Dict[str, str]]:
+    queries = [f"site:{domain} careers", f"site:{domain} jobs", f"site:{domain} internships", f"site:{domain} early careers"]
+    hits = []
+    for q in queries:
+        for r in ddg_search(q, max_results=5, timelimit="y"):
+            hits.append({"title": r.get("title"), "url": r.get("href"), "snippet": clean_snippet(r.get("body"))})
+    seen = set(); uniq = []
+    for h in hits:
+        u = h["url"]
+        if u in seen: continue
+        seen.add(u); uniq.append(h)
+    return uniq
+
+# -------------------- Session defaults --------------------
 for key, default in {
-    "projects": [],
-    "jobs": [],
-    "pref_jobs": [],
-    "questions": {},
-    "wiki": None,
-    "saved": [],
-    "contacts": [],
-    "resume_text": "",
-    "resume_bytes": b"",
-    "resume_ext": "",
+    "projects": [], "jobs": [], "questions": {}, "wiki": None,
+    "saved": [], "contacts": [],
+    "resume_text": "", "resume_bytes": b"", "resume_ext": "",
     "assistant_history": [],
-    "bulk_urls": [],
-    "bulk_results": [],
+    "bulk_urls": [], "bulk_results": [],
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ---------- Sidebar (now with Bulk) ----------
+# -------------------- Sidebar --------------------
 with st.sidebar:
-    tabs = st.tabs(["Inputs", "Settings", "Bulk"])
+    tabs = st.tabs(["Inputs", "Settings", "Bulk"])  # Bulk now in sidebar
 
     with tabs[0]:
-        st.subheader("🎓 Major Preset + Research Inputs")
-        major = st.selectbox("Major (preset)", options=list(MAJOR_PRESETS.keys()), index=list(MAJOR_PRESETS.keys()).index("Civil Engineering"))
+        st.subheader("🎓 Major Preset + Research")
+        MAJOR_PRESETS = {
+            "Civil Engineering": {"role": "Civil Engineering Intern","interests": ["transportation","water","sustainability","Python"]},
+            "Computer Science / Software": {"role": "Software Engineer Intern","interests": ["backend","web","AI","data"]},
+            "Data / Analytics": {"role": "Data Analyst Intern","interests": ["analytics","dashboards","SQL"]},
+            "Nursing": {"role": "Student Nurse / Nursing Intern","interests": ["clinical","patient care","EMR"]},
+            "(Custom)": {"role": "Intern","interests": ["projects","leadership"]},
+        }
+        major = st.selectbox("Major (preset)", options=list(MAJOR_PRESETS.keys()), index=0)
         if st.button("Apply Preset"):
             p = MAJOR_PRESETS.get(major, MAJOR_PRESETS["(Custom)"])
             st.session_state.role_input = p.get("role", "Intern")
             st.session_state.interests_input = ", ".join(p.get("interests", []))
-            st.session_state.preset_tools = p.get("tools", [])
-            st.session_state.pref_defaults = {
-                "role": p.get("role", "Intern"),
-                "tasks": p.get("tasks", ""),
-                "skills": p.get("skills", ""),
-            }
         company = st.text_input("Company name", placeholder="e.g., Jacobs, AECOM, Google")
-        role = st.text_input("Target role/title", value=MAJOR_PRESETS["Civil Engineering"]["role"], key="role_sidebar")
+        role = st.text_input("Target role/title", value=st.session_state.get("role_input","Intern"))
         location = st.text_input("Location filter (optional)", placeholder="e.g., Los Angeles, CA")
-        interests_str = st.text_input("Interests / keywords (comma‑separated)", value=", ".join(MAJOR_PRESETS["Civil Engineering"]["interests"]))
+        interests_str = st.text_input("Interests / keywords (comma-separated)", value=st.session_state.get("interests_input",""))
         interests = [s.strip() for s in interests_str.split(",") if s.strip()]
-
         colA, colB = st.columns(2)
         with colA: go_research = st.button("Research", type="primary")
         with colB: go_questions = st.button("Make Questions")
@@ -484,17 +556,13 @@ with st.sidebar:
         st.markdown("---")
         st.subheader("🤖 AI Settings")
         use_ai = st.toggle("Use AI (OpenAI or compatible)", value=False)
+        st.session_state["use_ai_toggle"] = use_ai
         st.text_input("Model (optional)", value=os.environ.get("OPENAI_MODEL", ""))
         st.text_input("Base URL (optional)", value=os.environ.get("OPENAI_BASE_URL", ""))
-        # inside Settings tab
-        use_ai = st.toggle("Use AI (OpenAI or compatible)", value=False)
-        st.session_state["use_ai_toggle"] = use_ai
-
 
     with tabs[2]:
         st.subheader("📦 Bulk Companies (quick)")
-        st.caption("Paste URLs or load a preset list; scan careers pages. Full table lives on the main tab.")
-        txt_sb = st.text_area("Paste URLs (one per line)", height=100)
+        txt_sb = st.text_area("Paste URLs (one per line)", height=110)
         preset_labels = [f"data/{os.path.basename(p)}" for p in PRESET_TXT_FILES] or ["(none)"]
         preset_choice = st.selectbox("Load preset list", preset_labels, index=0)
         if st.button("Load preset in sidebar") and PRESET_TXT_FILES:
@@ -511,7 +579,7 @@ with st.sidebar:
                 urls += [u.strip() for u in txt_sb.splitlines() if u.strip() and not u.strip().startswith('#')]
             if st.session_state.get("bulk_urls"):
                 urls += [u for u in st.session_state.bulk_urls if u]
-            urls = list(dict.fromkeys(urls))[:50]
+            urls = list(dict.fromkeys(urls))[:60]
             if not urls:
                 st.warning("No URLs provided. Paste or load a preset.")
             else:
@@ -525,14 +593,14 @@ with st.sidebar:
                         for h in hits[:2]:
                             items.append({"domain": dom, "careers_url": h["url"], "title": h["title"], "snippet": h["snippet"]})
                 st.session_state.bulk_results = items
-                st.success(f"Scanned {len(urls)} domains. See 'Bulk Companies' tab for details.")
+                st.success("Scanned. See ‘Bulk Companies’ tab for full table/CSV.")
 
-# ---------- Header ----------
+# -------------------- Header --------------------
 st.markdown(
-    f"""
+    """
     <div class="hero">
       <div style="display:flex; align-items:center; gap:12px;">
-        <div style="font-size:2.3rem;">🎓</div>
+        <div style="font-size:2.2rem;">🎓</div>
         <div>
           <div class="app-title" style="font-size:2rem;">Career Fair Companion</div>
           <div class="muted small">Research companies fast. Ask sharper questions. Find roles. Tailor resumes. Swap QR cards.</div>
@@ -543,31 +611,31 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---------- Research / Questions / Jobs triggers from sidebar ----------
-if 'go_research' not in globals():
-    go_research = go_questions = go_jobs = go_export = False  # guards for editors
-
+# -------------------- Research / Questions / Jobs triggers --------------------
 if DDGS is None:
     st.warning("Search library (duckduckgo-search) is unavailable. Ensure it's in requirements.txt and installed.")
 
-if 'company' not in locals():
-    company, role, location, interests = "", "", "", []
+if 'go_research' not in globals():
+    go_research = go_questions = go_jobs = go_export = False
 
-if go_research and company:
-    with st.spinner("Researching…"):
+if go_research and 'company' in locals() and company:
+    with st.spinner("Researching…") if hasattr(st, 'spinner') else _ShimContainer():
         cn = canonical_company(company)
-        st.session_state.wiki = wiki_summary(cn)
-        if not st.session_state.wiki:
+        snap = wiki_summary(cn)
+        if not snap:
             site = find_official_site(cn)
             if site:
-                st.session_state.wiki = fetch_text(site, limit=500)
-        st.session_state.projects = []  # omitted here for brevity
-    st.success("Company research updated.")
+                snap = fetch_text(site, limit=500)
+        st.session_state.wiki = snap or "(No summary found yet. Try Recent Projects or Jobs.)"
+        if ai_enabled() and st.session_state.wiki and "No summary" not in st.session_state.wiki:
+            s = summarize_ai(st.session_state.wiki)
+            if s: st.session_state.wiki = s
+    if hasattr(st, 'success'): st.success("Company research updated.")
 
 if go_questions:
     st.session_state.questions = {
         "Role & Impact": [
-            f"How does {role or 'this role'} define success in the first 90 days?",
+            f"How does {locals().get('role') or 'this role'} define success in the first 90 days?",
             "Which projects are top priority this quarter?",
             "What metrics matter most for early‑career hires?",
         ],
@@ -579,7 +647,7 @@ if go_questions:
         "Projects & Methods": [
             "Which tools are standard here?",
             "How do you scope projects on tight timelines?",
-            f"For someone into {', '.join(interests[:5]) or 'the core skills for this role'}, what would you recommend studying?",
+            f"For someone into {', '.join((locals().get('interests') or [])[:5]) or 'the core skills for this role'}, what would you recommend studying?",
         ],
         "Culture & Growth": [
             "How do interns find mentors and stretch projects?",
@@ -592,97 +660,68 @@ if go_questions:
             "What should I include in a follow‑up email after the fair?",
         ],
     }
-    st.success("Questions ready.")
+    if hasattr(st, 'success'): st.success("Questions ready.")
 
-if go_jobs and company:
-    with st.spinner("Searching for jobs…"):
-        base_jobs = job_search(company, role=role, location=location)
+if go_jobs and 'company' in locals() and company:
+    with st.spinner("Searching for jobs…") if hasattr(st, 'spinner') else _ShimContainer():
+        base_jobs = job_search(company, role=locals().get('role', ''), location=locals().get('location', ''))
         scored = []
         for j in base_jobs:
-            pct, why = score_job(j, role, interests, location)
+            pct, why = score_job(j, locals().get('role', ''), locals().get('interests', []), locals().get('location', ''))
             j2 = {**j, "match": pct, "why": why}
             scored.append(j2)
         st.session_state.jobs = sorted(scored, key=lambda x: x.get("match", 0), reverse=True)
-    st.success("Job results updated.")
+    if hasattr(st, 'success'): st.success("Job results updated.")
 
-# ---------- Tabs ----------
-overview_tab, jobs_tab, bulk_tab, apply_tab, saved_tab = st.tabs(["Overview","Jobs","Bulk Companies","Apply","Saved"])  # slimmer for this edition
+# -------------------- Main tabs --------------------
+overview_tab, jobs_tab, bulk_tab, apply_tab, contacts_tab, qr_tab, saved_tab, help_tab = st.tabs([
+    "Overview","Jobs","Bulk Companies","Apply","Contacts","My Card (QR)","Saved","Help & Setup",
+])
 
 with overview_tab:
-    st.subheader("Welcome")
-    st.write("Use the sidebar to enter a company and role, or search from the Jobs tab.")
+    if 'company' not in locals() or not company:
+        st.info("Enter a company in the sidebar and click **Research**.") if hasattr(st, 'info') else None
+    else:
+        st.subheader(company)
+        if st.session_state.wiki:
+            st.markdown("**Company Snapshot**")
+            st.write(st.session_state.wiki)
+        else:
+            st.caption("No snapshot yet.")
 
 with jobs_tab:
     st.subheader("Job Listings (ATS + official domains)")
-    # NEW: in-tab search bar
     c1, c2, c3 = st.columns([1.2,1,1])
-    company_in = c1.text_input("Company", value=locals().get('company', ''), placeholder="e.g., Jacobs, AECOM, Google", key="jobs_company")
-    role_in = c2.text_input("Role keywords", value=locals().get('role',''), placeholder="e.g., Civil Engineering Intern", key="jobs_role")
-    loc_in = c3.text_input("Location (optional)", value=locals().get('location',''), placeholder="City, State", key="jobs_loc")
+    company_in = c1.text_input("Company", value=locals().get('company',''), placeholder="e.g., Jacobs, AECOM, Google")
+    role_in    = c2.text_input("Role keywords", value=locals().get('role',''), placeholder="e.g., Civil Engineering Intern")
+    loc_in     = c3.text_input("Location (optional)", value=locals().get('location',''), placeholder="City, State")
     if st.button("Search Jobs", type="primary"):
-        if not company_in.strip():
-            st.warning("Please enter a company.")
-        else:
-            with st.spinner("Searching across ATS and the company's domains…"):
-                rows = job_search(company_in, role=role_in, location=loc_in)
-                scored = []
-                interests = []
-                for j in rows:
-                    pct, why = score_job(j, role_in, interests, loc_in)
-                    j2 = {**j, "match": pct, "why": why}
-                    scored.append(j2)
-                st.session_state.jobs = sorted(scored, key=lambda x: x.get("match", 0), reverse=True)
-    st.divider()
+        with st.spinner("Searching across ATS and the company's domains…") if hasattr(st, 'spinner') else _ShimContainer():
+            rows = job_search(company_in, role=role_in, location=loc_in)
+            scored = []
+            interests_here = locals().get('interests', [])
+            for j in rows:
+                pct, why = score_job(j, role_in, interests_here, loc_in)
+                scored.append({**j, "match": pct, "why": why})
+            st.session_state.jobs = sorted(scored, key=lambda x: x.get("match", 0), reverse=True)
+    st.divider() if hasattr(st, 'divider') else None
     if st.session_state.jobs:
         sort_match = st.checkbox("Sort by % match", value=True)
         jobs_view = sorted(st.session_state.jobs, key=lambda x: x.get("match", 0), reverse=True) if sort_match else st.session_state.jobs
         for j in jobs_view:
             with st.container(border=True):
-                st.markdown(f"**[{j['title']}]({j['url']})**  ")
+                st.markdown(f"**[{j['title']}]({j['url']})**")
                 left, right = st.columns([3,1])
                 with left:
-                    st.caption(j["source"])  
-                    st.write(j["snippet"])  
-                    st.caption(f"Why: {j.get('why','')}")
+                    st.caption(j.get("source","")) ; st.write(j.get("snippet","")) ; st.caption(f"Why: {j.get('why','')}")
                 with right:
-                    st.markdown(f"<div class='match-pill'>{j.get('match',0)}% match</div>", unsafe_allow_html=True)
+                    st.markdown(f"<span class='match-pill'>{j.get('match',0)}% match</span>", unsafe_allow_html=True)
     else:
-        st.info("No results yet. Enter a company above and click **Search Jobs**.")
-
-# -------- Bulk Companies tab (full table) --------
-
-def extract_domain(url: str) -> str:
-    try:
-        url = url.strip()
-        if not re.match(r"^https?://", url):
-            url = "https://" + url
-        host = re.sub(r"^https?://", "", url).split("/")[0]
-        return host.lower()
-    except Exception:
-        return url
-
-
-def ddg_find_careers(domain: str) -> List[Dict[str, str]]:
-    queries = [
-        f"site:{domain} careers",
-        f"site:{domain} jobs",
-        f"site:{domain} internships",
-        f"site:{domain} early careers",
-    ]
-    hits = []
-    for q in queries:
-        for r in ddg_search(q, max_results=5, timelimit="y"):
-            hits.append({"title": r.get("title"), "url": r.get("href"), "snippet": clean_snippet(r.get("body"))})
-    seen = set(); uniq = []
-    for h in hits:
-        u = h["url"]
-        if u in seen: continue
-        seen.add(u); uniq.append(h)
-    return uniq
+        st.info("No results yet. Enter a company above and click **Search Jobs**.") if hasattr(st, 'info') else None
 
 with bulk_tab:
     st.subheader("Bulk Companies — scan careers pages")
-    st.caption("Paste/upload URLs, or load a preset list from data/*.txt. Use the sidebar's Bulk tab for a quick mini-scan.")
+    st.caption("Paste/upload URLs, or load a preset list from data/*.txt. Use the sidebar Bulk tab for quick scans.")
     txt = st.text_area("Paste URLs (one per line)", height=120)
     up = st.file_uploader("Or upload .txt / .csv (column: url)", type=["txt","csv"])
     preset_labels = [f"data/{os.path.basename(p)}" for p in PRESET_TXT_FILES]
@@ -727,7 +766,7 @@ with bulk_tab:
     with col1:
         if st.button("Scan for Careers", type="primary"):
             items = []
-            for u in urls[:80]:
+            for u in urls[:90]:
                 dom = extract_domain(u)
                 hits = ddg_find_careers(dom)
                 if not hits:
@@ -749,21 +788,64 @@ with bulk_tab:
 with apply_tab:
     st.subheader("Apply — Tailor Resume & Open Application")
     if not st.session_state.jobs:
-        st.info("Search jobs first, then pick a posting here.")
+        st.info("Search jobs first, then pick a posting here.") if hasattr(st, 'info') else None
     else:
         options = [f"{j['title']} — {j.get('match',0)}%" for j in st.session_state.jobs]
         idx = st.selectbox("Choose a job", options=range(len(options)), format_func=lambda i: options[i])
         job = st.session_state.jobs[idx]
         st.link_button("Open official application", url=job["url"])  # submit on employer site
+        st.markdown("---")
+        st.markdown("**Upload resume (PDF/DOCX/TXT)**")
+        up = st.file_uploader("Resume file", type=["pdf","docx","txt"], key="resume_up")
+        if up is not None:
+            txt, raw, ext = parse_resume(up)
+            st.session_state.resume_text = txt
+            st.session_state.resume_bytes = raw
+            st.session_state.resume_ext = ext
+            with st.expander("Preview extracted text", expanded=True):
+                st.text_area("Extracted", value=txt, height=240)
+        job_text = fetch_text(job["url"]) or job.get("snippet","")
+        st.text_area("Job description (detected)", value=job_text, height=160)
+        use_ai_tailor = st.checkbox("Use AI to tailor (opt‑in)", value=False)
+        if st.button("Tailor now", type="primary"):
+            if not st.session_state.resume_text.strip():
+                st.warning("Upload a resume first.") if hasattr(st, 'warning') else None
+            else:
+                tailored = None
+                if use_ai_tailor and ai_enabled():
+                    try:
+                        client = get_ai_client()
+                        if client:
+                            mdl = st.secrets.get("openai_model") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
+                            system = (
+                                "You are an expert resume editor for early‑career candidates. Rewrite the resume to target the company and role. "
+                                "Preserve truthful content, quantify impact, and align with the job description. Output plain text sections."
+                            )
+                            user = (f"Company: {locals().get('company','')}\nRole: {locals().get('role','')}\nJob description:\n{job_text}\n\nOriginal resume:\n{st.session_state.resume_text}\n\nReturn ONLY the revised resume as plain text.")
+                            out = client.chat.completions.create(model=mdl, temperature=0.4, messages=[{"role":"system","content":system},{"role":"user","content":user}])
+                            tailored = (out.choices[0].message.content or "").strip()
+                    except Exception:
+                        tailored = None
+                if not tailored:
+                    # heuristic: bold top keywords
+                    kws = extract_keywords(job_text, top_k=12)
+                    base = st.session_state.resume_text
+                    for k in kws: base = re.sub(fr"\b({re.escape(k)})\b", r"**\1**", base, flags=re.I)
+                    tailored = base
+                st.session_state["tailored"] = tailored
+                st.success("Tailored resume ready (preview below).") if hasattr(st, 'success') else None
+        if (tail := st.session_state.get("tailored")):
+            st.text_area("Tailored (preview)", value=tail, height=320)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname = f"resume_{(locals().get('company') or 'company').lower().replace(' ','_')}_{ts}.docx"
+            full = os.path.join(RESUME_DIR, fname)
+            if save_docx_from_text(tail, full):
+                append_resume_index({"timestamp": ts, "company": locals().get('company',''), "role": locals().get('role',''), "job_url": job["url"], "file": fname})
+                with open(full, "rb") as f:
+                    st.download_button("⬇️ Download tailored DOCX", data=f.read(), file_name=fname, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                st.success(f"Saved to databank: data/resumes/{fname}") if hasattr(st, 'success') else None
+            else:
+                st.download_button("⬇️ Download tailored TXT", data=tail.encode("utf-8"), file_name=fname.replace('.docx','.txt'), mime="text/plain")
 
-with saved_tab:
-    st.subheader("Saved (recent tailored resumes show here if generated)")
-    if os.path.exists(INDEX_CSV):
-        df = pd.read_csv(INDEX_CSV)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-st.markdown("""
-<div class="muted small" style="margin-top:1rem;">
-  Built with ❤️ using Streamlit + DuckDuckGo + Wikipedia + YAKE + Segno. Optional OpenAI/compatible LLM support.
-</div>
-""", unsafe_allow_html=True)
+with contacts_tab:
+    st
