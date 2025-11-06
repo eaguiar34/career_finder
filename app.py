@@ -761,7 +761,7 @@ if not urls and os.path.exists(BULK_FILE):
 
 # De-dup while keeping order
 urls = list(dict.fromkeys(urls))
-    with col1:
+with col1:
         if st.button("Scan for Careers", type="primary"):
             items = []
             for u in urls[:80]:
