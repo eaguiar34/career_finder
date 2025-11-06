@@ -762,21 +762,21 @@ if not urls and os.path.exists(BULK_FILE):
 # De-dup while keeping order
 urls = list(dict.fromkeys(urls))
 with col1:
-        if st.button("Scan for Careers", type="primary"):
+    if st.button("Scan for Careers", type="primary"):
             items = []
-            for u in urls[:80]:
+        for u in urls[:80]:
                 dom = extract_domain(u)
                 hits = ddg_find_careers(dom)
-                if not hits:
+            if not hits:
                     items.append({"domain": dom, "careers_url": "(none)", "title": "", "snippet": ""})
-                else:
-                    for h in hits[:3]:
+            else:
+                for h in hits[:3]:
                         items.append({"domain": dom, "careers_url": h["url"], "title": h["title"], "snippet": h["snippet"]})
             st.session_state.bulk_urls = urls
             st.session_state.bulk_results = items
             st.success("Bulk results updated.")
 with col2:
-        if st.session_state.bulk_results:
+    if st.session_state.bulk_results:
             dfb = pd.DataFrame(st.session_state.bulk_results)
             st.download_button("⬇️ Download CSV", data=dfb.to_csv(index=False).encode("utf-8"), file_name="bulk_careers.csv", mime="text/csv")
 
