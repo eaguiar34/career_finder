@@ -486,6 +486,10 @@ with st.sidebar:
         use_ai = st.toggle("Use AI (OpenAI or compatible)", value=False)
         st.text_input("Model (optional)", value=os.environ.get("OPENAI_MODEL", ""))
         st.text_input("Base URL (optional)", value=os.environ.get("OPENAI_BASE_URL", ""))
+        # inside Settings tab
+        use_ai = st.toggle("Use AI (OpenAI or compatible)", value=False)
+        st.session_state["use_ai_toggle"] = use_ai
+
 
     with tabs[2]:
         st.subheader("📦 Bulk Companies (quick)")
