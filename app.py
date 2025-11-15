@@ -41,16 +41,38 @@ except ModuleNotFoundError:  # crash-safe path for sandbox/test runners
             self.session_state: Dict[str, Any] = {}
             self.secrets: Dict[str, Any] = {}
             self.sidebar = _ShimContainer()
+        # Explicit shims for APIs that must exist
+        def spinner(self, *args, **kwargs):
+            return _ShimContainer()
+        def container(self, *args, **kwargs):
+            return _ShimContainer()
+        def expander(self, *args, **kwargs):
+            return _ShimContainer()
+        def tabs(self, labels):
+            # Accept list/tuple or int
+            try:
+                if isinstance(labels, int):
+                    n = max(1, int(labels))
+                else:
+                    n = max(1, int(len(list(labels))))
+            except Exception:
+                n = 1
+            return [_ShimContainer() for _ in range(n)]
+        def columns(self, spec=None, *args, **kwargs):
+            # Streamlit accepts an int (n columns) or a sequence of ratios
+            if spec is None:
+                n = 2
+            elif isinstance(spec, int):
+                n = max(1, spec)
+            else:
+                try:
+                    n = max(1, len(list(spec)))
+                except Exception:
+                    n = 2
+            return [_ShimContainer() for _ in range(n)]
+        # Generic no-ops
         def __getattr__(self, name):
             def _noop(*args, **kwargs):
-                if name == "tabs":
-                    labels = args[0] if args else []
-                    return [_ShimContainer() for _ in labels]
-                if name == "columns":
-                    sizes = args[0] if args else [1, 1]
-                    return [_ShimContainer() for _ in sizes]
-                if name in ("container", "expander"):
-                    return _ShimContainer()
                 # No-op UI calls
                 if name in (
                     "file_uploader", "link_button", "image", "download_button",
@@ -321,7 +343,52 @@ def categorize_domain(url: str) -> str:
         return "Press/Blog"
     return "Other"
 
-# Core job aggregator
+# -------------------- Source preference + de-duplication --------------------
+
+def get_source_bonus(src: str) -> float:
+    """Map source -> bonus weight based on user preference.
+    Value is multiplied by 10 in the final score.
+    Profiles:
+      - ATS-first: ATS=1.0, Job Board=0.6, Other=0.4 (default)
+      - Balanced:  ATS=0.8, Job Board=0.8, Other=0.4
+      - Discovery: ATS=0.8, Job Board=1.0, Other=0.4
+    """
+    pref = st.session_state.get("source_pref", "ATS-first")
+    if pref == "Balanced":
+        weights = {"ATS": 0.8, "Job Board": 0.8, "Other": 0.4}
+    elif pref == "Discovery":
+        weights = {"ATS": 0.8, "Job Board": 1.0, "Other": 0.4}
+    else:  # ATS-first
+        weights = {"ATS": 1.0, "Job Board": 0.6, "Other": 0.4}
+    return weights.get(src, 0.4)
+
+# De-duplication helper: prefer ATS when multiple entries share the same title
+
+def _norm_title_key(title: str) -> str:
+    t = (title or "").lower()
+    t = re.sub(r"\b(internship|intern|new grad|graduate|early career)\b", "", t)
+    t = re.sub(r"[^a-z0-9]+", " ", t).strip()
+    return t
+
+
+def dedupe_jobs(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """De-duplicate by URL and normalized title; prefer ATS over Job Board over Other."""
+    seen_urls: set = set()
+    best_by_title: Dict[str, Dict[str, Any]] = {}
+    def rank(src: str) -> int:
+        return {"ATS": 2, "Job Board": 1, "Other": 0}.get(src, 0)
+    for r in rows:
+        u = r.get("url")
+        if not u or u in seen_urls:
+            continue
+        seen_urls.add(u)
+        key = _norm_title_key(r.get("title", ""))
+        prev = best_by_title.get(key)
+        if prev is None or rank(r.get("source", "Other")) > rank(prev.get("source", "Other")):
+            best_by_title[key] = r
+    return list(best_by_title.values())
+
+# -------------------- Core job aggregator --------------------
 
 def job_search(company: str, role: str = "", location: str = "", max_results: int = 30) -> List[Dict[str, Any]]:
     brand = canonical_company(company)
@@ -359,15 +426,11 @@ def job_search(company: str, role: str = "", location: str = "", max_results: in
         for r in ddg_search(f"{brand} {role or 'internship'} apply", max_results=8, timelimit="m"):
             rows.append({"title": r["title"], "url": r["href"], "snippet": clean_snippet(r["body"]), "source": categorize_domain(r["href"])})
 
-    # De‑dup
-    seen, uniq = set(), []
-    for row in rows:
-        u = row["url"]
-        if u in seen: continue
-        seen.add(u); uniq.append(row)
+    # De‑dup & limit
+    uniq = dedupe_jobs(rows)
     return uniq[:max_results]
 
-# %-match scoring
+# -------------------- %-match scoring --------------------
 
 def _norm_tokens(s: str) -> List[str]:
     s = s.lower(); s = re.sub(r"[^a-z0-9\+\-\s]", " ", s)
@@ -382,13 +445,13 @@ def score_job(job: Dict[str, Any], role: str, interests: List[str], location: st
     overlap = sum(1 for i in interests_norm if any(tok in body_tokens for tok in _norm_tokens(i)))
     interest_ratio = (overlap / max(1, len(interests_norm))) if interests_norm else 0.0
     loc_hit = 1 if (location and location.lower() in (title + " " + body + " " + url).lower()) else 0
-    src = job.get("source", "Other"); source_bonus = {"ATS": 1.0, "Job Board": 0.6, "Other": 0.4}.get(src, 0.4)
+    src = job.get("source", "Other"); source_bonus = get_source_bonus(src)
     score = 40 * role_ratio + 40 * interest_ratio + 10 * loc_hit + 10 * source_bonus
     score = max(0, min(100, int(round(score))))
     reason = f"role~{int(role_ratio*100)}%, interests {overlap}/{len(interests_norm) or 1}, location {'✓' if loc_hit else '—'}, source {src}"
     return score, reason
 
-# Keyword extractor
+# -------------------- Keyword extractor --------------------
 
 def extract_keywords(text: str, top_k: int = 12) -> List[str]:
     t = (text or "").strip()
@@ -554,6 +617,17 @@ with st.sidebar:
         custom_accent  = st.color_picker("Accent", value=accent)
         apply_theme(custom_primary or primary, custom_accent or accent)
         st.markdown("---")
+        st.subheader("🔎 Search ranking")
+        _pref_options = ["ATS-first", "Balanced", "Discovery"]
+        _pref_default = st.session_state.get("source_pref", "ATS-first")
+        source_pref = st.selectbox(
+            "Source preference",
+            options=_pref_options,
+            index=_pref_options.index(_pref_default) if _pref_default in _pref_options else 0,
+            help="Control ranking bias: ATS-first (precise + direct apply), Balanced, or Discovery (broader via job boards).",
+        )
+        st.session_state["source_pref"] = source_pref
+        st.markdown("---")
         st.subheader("🤖 AI Settings")
         use_ai = st.toggle("Use AI (OpenAI or compatible)", value=False)
         st.session_state["use_ai_toggle"] = use_ai
@@ -619,7 +693,7 @@ if 'go_research' not in globals():
     go_research = go_questions = go_jobs = go_export = False
 
 if go_research and 'company' in locals() and company:
-    with st.spinner("Researching…") if hasattr(st, 'spinner') else _ShimContainer():
+    with st.spinner("Researching…"):
         cn = canonical_company(company)
         snap = wiki_summary(cn)
         if not snap:
@@ -630,7 +704,7 @@ if go_research and 'company' in locals() and company:
         if ai_enabled() and st.session_state.wiki and "No summary" not in st.session_state.wiki:
             s = summarize_ai(st.session_state.wiki)
             if s: st.session_state.wiki = s
-    if hasattr(st, 'success'): st.success("Company research updated.")
+    st.success("Company research updated.")
 
 if go_questions:
     st.session_state.questions = {
@@ -660,10 +734,10 @@ if go_questions:
             "What should I include in a follow‑up email after the fair?",
         ],
     }
-    if hasattr(st, 'success'): st.success("Questions ready.")
+    st.success("Questions ready.")
 
 if go_jobs and 'company' in locals() and company:
-    with st.spinner("Searching for jobs…") if hasattr(st, 'spinner') else _ShimContainer():
+    with st.spinner("Searching for jobs…"):
         base_jobs = job_search(company, role=locals().get('role', ''), location=locals().get('location', ''))
         scored = []
         for j in base_jobs:
@@ -671,7 +745,7 @@ if go_jobs and 'company' in locals() and company:
             j2 = {**j, "match": pct, "why": why}
             scored.append(j2)
         st.session_state.jobs = sorted(scored, key=lambda x: x.get("match", 0), reverse=True)
-    if hasattr(st, 'success'): st.success("Job results updated.")
+    st.success("Job results updated.")
 
 # -------------------- Main tabs --------------------
 overview_tab, jobs_tab, bulk_tab, apply_tab, contacts_tab, qr_tab, saved_tab, help_tab = st.tabs([
@@ -680,7 +754,7 @@ overview_tab, jobs_tab, bulk_tab, apply_tab, contacts_tab, qr_tab, saved_tab, he
 
 with overview_tab:
     if 'company' not in locals() or not company:
-        st.info("Enter a company in the sidebar and click **Research**.") if hasattr(st, 'info') else None
+        st.info("Enter a company in the sidebar and click **Research**.")
     else:
         st.subheader(company)
         if st.session_state.wiki:
@@ -696,7 +770,7 @@ with jobs_tab:
     role_in    = c2.text_input("Role keywords", value=locals().get('role',''), placeholder="e.g., Civil Engineering Intern")
     loc_in     = c3.text_input("Location (optional)", value=locals().get('location',''), placeholder="City, State")
     if st.button("Search Jobs", type="primary"):
-        with st.spinner("Searching across ATS and the company's domains…") if hasattr(st, 'spinner') else _ShimContainer():
+        with st.spinner("Searching across ATS and the company's domains…"):
             rows = job_search(company_in, role=role_in, location=loc_in)
             scored = []
             interests_here = locals().get('interests', [])
@@ -704,7 +778,7 @@ with jobs_tab:
                 pct, why = score_job(j, role_in, interests_here, loc_in)
                 scored.append({**j, "match": pct, "why": why})
             st.session_state.jobs = sorted(scored, key=lambda x: x.get("match", 0), reverse=True)
-    st.divider() if hasattr(st, 'divider') else None
+    st.divider()
     if st.session_state.jobs:
         sort_match = st.checkbox("Sort by % match", value=True)
         jobs_view = sorted(st.session_state.jobs, key=lambda x: x.get("match", 0), reverse=True) if sort_match else st.session_state.jobs
@@ -717,7 +791,7 @@ with jobs_tab:
                 with right:
                     st.markdown(f"<span class='match-pill'>{j.get('match',0)}% match</span>", unsafe_allow_html=True)
     else:
-        st.info("No results yet. Enter a company above and click **Search Jobs**.") if hasattr(st, 'info') else None
+        st.info("No results yet. Enter a company above and click **Search Jobs**.")
 
 with bulk_tab:
     st.subheader("Bulk Companies — scan careers pages")
@@ -788,13 +862,17 @@ with bulk_tab:
 with apply_tab:
     st.subheader("Apply — Tailor Resume & Open Application")
     if not st.session_state.jobs:
-        st.info("Search jobs first, then pick a posting here.") if hasattr(st, 'info') else None
+        st.info("Search jobs first, then pick a posting here.")
     else:
         options = [f"{j['title']} — {j.get('match',0)}%" for j in st.session_state.jobs]
         idx = st.selectbox("Choose a job", options=range(len(options)), format_func=lambda i: options[i])
         job = st.session_state.jobs[idx]
-        st.link_button("Open official application", url=job["url"])  # submit on employer site
+
+        # Direct application on employer site
+        st.link_button("Open official application", url=job["url"])
         st.markdown("---")
+
+        # Resume upload + preview
         st.markdown("**Upload resume (PDF/DOCX/TXT)**")
         up = st.file_uploader("Resume file", type=["pdf","docx","txt"], key="resume_up")
         if up is not None:
@@ -804,48 +882,210 @@ with apply_tab:
             st.session_state.resume_ext = ext
             with st.expander("Preview extracted text", expanded=True):
                 st.text_area("Extracted", value=txt, height=240)
-        job_text = fetch_text(job["url"]) or job.get("snippet","")
+
+        # Pull job description text (best-effort)
+        job_text = fetch_text(job["url"]) or job.get("snippet", "")
         st.text_area("Job description (detected)", value=job_text, height=160)
-        use_ai_tailor = st.checkbox("Use AI to tailor (opt‑in)", value=False)
+
+        use_ai_tailor = st.checkbox("Use AI to tailor (opt-in)", value=False)
+
         if st.button("Tailor now", type="primary"):
             if not st.session_state.resume_text.strip():
-                st.warning("Upload a resume first.") if hasattr(st, 'warning') else None
+                st.warning("Upload a resume first.")
             else:
                 tailored = None
+                # --- AI path (optional) ---
                 if use_ai_tailor and ai_enabled():
                     try:
                         client = get_ai_client()
                         if client:
-                            mdl = st.secrets.get("openai_model") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
-                            system = (
-                                "You are an expert resume editor for early‑career candidates. Rewrite the resume to target the company and role. "
-                                "Preserve truthful content, quantify impact, and align with the job description. Output plain text sections."
+                            mdl = (
+                                st.secrets.get("openai_model")
+                                or os.environ.get("OPENAI_MODEL")
+                                or "gpt-4o-mini"
                             )
-                            user = (f"Company: {locals().get('company','')}\nRole: {locals().get('role','')}\nJob description:\n{job_text}\n\nOriginal resume:\n{st.session_state.resume_text}\n\nReturn ONLY the revised resume as plain text.")
-                            out = client.chat.completions.create(model=mdl, temperature=0.4, messages=[{"role":"system","content":system},{"role":"user","content":user}])
+                            system = (
+                                "You are an expert resume editor for early-career candidates. "
+                                "Rewrite the resume to target the company and role. "
+                                "Preserve truthful content, quantify impact, and align with the job description. "
+                                "Output plain text sections."
+                            )
+                            user = (
+                                f"Company: {locals().get('company','')}\n"
+                                f"Role: {locals().get('role','')}\n"
+                                f"Job description:\n{job_text}\n\n"
+                                f"Original resume:\n{st.session_state.resume_text}\n\n"
+                                "Return ONLY the revised resume as plain text."
+                            )
+                            out = client.chat.completions.create(
+                                model=mdl,
+                                temperature=0.4,
+                                messages=[
+                                    {"role": "system", "content": system},
+                                    {"role": "user", "content": user},
+                                ],
+                            )
                             tailored = (out.choices[0].message.content or "").strip()
                     except Exception:
                         tailored = None
+
+                # --- Heuristic fallback (keyword highlight) ---
                 if not tailored:
-                    # heuristic: bold top keywords
                     kws = extract_keywords(job_text, top_k=12)
                     base = st.session_state.resume_text
-                    for k in kws: base = re.sub(fr"\b({re.escape(k)})\b", r"**\1**", base, flags=re.I)
+                    for k in kws:
+                        base = re.sub(fr"\b({re.escape(k)})\b", r"**\1**", base, flags=re.I)
                     tailored = base
+
                 st.session_state["tailored"] = tailored
-                st.success("Tailored resume ready (preview below).") if hasattr(st, 'success') else None
+                st.success("Tailored resume ready (preview below).")
+
+        # Preview + save/download
         if (tail := st.session_state.get("tailored")):
             st.text_area("Tailored (preview)", value=tail, height=320)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             fname = f"resume_{(locals().get('company') or 'company').lower().replace(' ','_')}_{ts}.docx"
             full = os.path.join(RESUME_DIR, fname)
+
             if save_docx_from_text(tail, full):
-                append_resume_index({"timestamp": ts, "company": locals().get('company',''), "role": locals().get('role',''), "job_url": job["url"], "file": fname})
+                append_resume_index({
+                    "timestamp": ts,
+                    "company": locals().get("company",""),
+                    "role": locals().get("role",""),
+                    "job_url": job["url"],
+                    "file": fname
+                })
                 with open(full, "rb") as f:
-                    st.download_button("⬇️ Download tailored DOCX", data=f.read(), file_name=fname, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                st.success(f"Saved to databank: data/resumes/{fname}") if hasattr(st, 'success') else None
+                    st.download_button(
+                        "⬇️ Download tailored DOCX",
+                        data=f.read(),
+                        file_name=fname,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                st.success(f"Saved to databank: data/resumes/{fname}")
             else:
-                st.download_button("⬇️ Download tailored TXT", data=tail.encode("utf-8"), file_name=fname.replace('.docx','.txt'), mime="text/plain")
+                st.download_button(
+                    "⬇️ Download tailored TXT",
+                    data=tail.encode("utf-8"),
+                    file_name=fname.replace(".docx", ".txt"),
+                    mime="text/plain",
+                )
 
 with contacts_tab:
-    st
+    st.subheader("Find Recruiters / HR / University Contacts")
+    if st.button("Search Contacts", type="primary"):
+        hits = find_contacts(locals().get('company',''), locals().get('role',''))
+        if hits:
+            for h in hits:
+                with st.container(border=True):
+                    st.markdown(f"**[{h['title']}]({h['url']})**")
+                    st.caption(h.get("source",""))
+                    st.write(h.get("snippet",""))
+        else:
+            st.caption("No contacts found — try a different spelling or add 'university recruiting'.")
+
+with qr_tab:
+    st.subheader("Create a QR Card for Networking")
+    name = st.text_input("Full name")
+    title_i = st.text_input("Title (e.g., Student)")
+    email = st.text_input("Email")
+    phone = st.text_input("Phone")
+    org = st.text_input("Organization / School")
+    linkedin = st.text_input("LinkedIn URL")
+    website = st.text_input("Personal site / portfolio URL")
+    mode = st.radio("QR content", ["vCard (contacts app)", "Just my LinkedIn URL"], horizontal=True)
+    if st.button("Generate QR", type="primary"):
+        if segno is None:
+            st.error("QR feature requires 'segno'. Ensure it's in requirements.txt and installed.")
+        else:
+            buf = io.BytesIO()
+            if mode.startswith("vCard"):
+                vcf = build_vcard(name, title_i, email, phone, org, linkedin, website)
+                segno.make(vcf).save(buf, kind="png", scale=6)
+            else:
+                url = linkedin or website
+                if not url:
+                    st.warning("Provide your LinkedIn or a URL.")
+                else:
+                    segno.make(url).save(buf, kind="png", scale=6)
+            if buf.getbuffer().nbytes:
+                st.image(buf.getvalue(), caption="Scan me!", use_column_width=False)
+                st.download_button("⬇️ Download QR (PNG)", data=buf.getvalue(), file_name="my_qr.png", mime="image/png")
+
+with saved_tab:
+    st.subheader("My Saved Items")
+    if os.path.exists(INDEX_CSV):
+        df = pd.read_csv(INDEX_CSV)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        for _, r in df.tail(8).iterrows():
+            fp = os.path.join(RESUME_DIR, str(r["file"]))
+            if os.path.exists(fp):
+                with open(fp, "rb") as f:
+                    st.download_button(f"⬇️ {r['file']}", data=f.read(), file_name=str(r["file"]))
+    else:
+        st.caption("No saved resumes yet.")
+
+with help_tab:
+    st.subheader("Setup & Notes")
+    st.markdown(
+        """
+        **Local setup**
+        ```bash
+        python -m venv .venv && source .venv/bin/activate
+        pip install -r requirements.txt
+        streamlit run app.py
+        ```
+        **Streamlit Cloud**: push to GitHub → deploy → add secrets if using AI.
+
+        **AI toggle**: When off (or no API key), the app never calls OpenAI. You still get search and resume keyword tailoring.
+
+        **Bulk lists**: Put any `.txt` under `data/` (one URL per line). Load them from the sidebar Bulk tab.
+        """
+    )
+
+# -------------------- Minimal tests (run when Streamlit is missing) --------------------
+def _run_tests():
+    print("Running basic tests…")
+    # canonicalization
+    assert canonical_company("jacobs") == "Jacobs Solutions"
+    # domain utils
+    assert extract_domain("https://www.jacobs.com/careers").startswith("www.jacobs.com")
+    assert categorize_domain("https://jobs.lever.co/acme") == "ATS"
+    # scoring (should be reasonably high for matching title/keywords/location)
+    sample_job = {
+        "title": "Civil Engineering Intern",
+        "url": "https://jobs.lever.co/acme/123",
+        "snippet": "Transportation projects using AutoCAD in Los Angeles",
+        "source": "ATS",
+    }
+    score, why = score_job(sample_job, "Civil Engineering Intern", ["transportation", "AutoCAD"], "Los Angeles")
+    assert 50 <= score <= 100, f"unexpected score: {score} ({why})"
+
+    # ---- Shim correctness ----
+    cols2 = st.columns(2); assert isinstance(cols2, list) and len(cols2) == 2
+    cols3 = st.columns([1, 1, 1]); assert isinstance(cols3, list) and len(cols3) == 3
+    tabs3 = st.tabs(["a", "b", "c"]); assert isinstance(tabs3, list) and len(tabs3) == 3
+    tabs2 = st.tabs(2); assert isinstance(tabs2, list) and len(tabs2) == 2
+    ctx = st.spinner("loading"); assert hasattr(ctx, "__enter__") and hasattr(ctx, "__exit__")
+
+    # ---- Source preference + dedupe behavior ----
+    st.session_state["source_pref"] = "Balanced"
+    job_ats = {"title": "Software Engineer Intern", "url": "https://ats.example/job1", "snippet": "", "source": "ATS"}
+    job_board = {"title": "Software Engineer Intern", "url": "https://board.example/job1", "snippet": "", "source": "Job Board"}
+    s_ats, _ = score_job(job_ats, "", [], "")
+    s_board, _ = score_job(job_board, "", [], "")
+    assert s_ats == s_board, f"Balanced should tie (ATS={s_ats}, Board={s_board})"
+
+    st.session_state["source_pref"] = "Discovery"
+    s_ats2, _ = score_job(job_ats, "", [], "")
+    s_board2, _ = score_job(job_board, "", [], "")
+    assert s_board2 > s_ats2, "Discovery should favor Job Boards"
+
+    kept = dedupe_jobs([job_board, job_ats])
+    assert len(kept) == 1 and kept[0]["source"] == "ATS", "Dedupe should prefer ATS for duplicate titles"
+
+    print("All tests passed.")
+
+if __name__ == "__main__":
+    if not _STREAMLIT_AVAILABLE or os.environ.get("NON_UI_MODE") == "1":
+        _run_tests()
